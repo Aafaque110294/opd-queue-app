@@ -33,6 +33,10 @@ create table if not exists public.tickets (
   token_number text not null, -- e.g., 'GEN-001'
   patient_name text not null,
   phone_number text,
+  patient_age integer check (patient_age is null or patient_age between 0 and 120),
+  patient_gender text,
+  paid_amount numeric(10, 2) check (paid_amount is null or paid_amount >= 0),
+  payment_mode text check (payment_mode is null or payment_mode in ('CASH', 'UPI', 'CARD', 'OTHER', 'NONE')),
   department_id uuid references public.departments(id) on delete cascade not null,
   doctor_id uuid references public.doctors(id) on delete set null,
   status ticket_status default 'waiting' not null,
@@ -42,6 +46,21 @@ create table if not exists public.tickets (
   completed_at timestamp with time zone,
   created_at timestamp with time zone default timezone('utc'::text, now()) not null
 );
+
+alter table public.tickets
+  add column if not exists patient_age integer
+  check (patient_age is null or patient_age between 0 and 120);
+
+alter table public.tickets
+  add column if not exists patient_gender text;
+
+alter table public.tickets
+  add column if not exists paid_amount numeric(10, 2)
+  check (paid_amount is null or paid_amount >= 0);
+
+alter table public.tickets
+  add column if not exists payment_mode text
+  check (payment_mode is null or payment_mode in ('CASH', 'UPI', 'CARD', 'OTHER', 'NONE'));
 
 -- 5. Enable Row Level Security (RLS)
 alter table public.departments enable row level security;
@@ -60,8 +79,19 @@ create policy "Allow public read access on tickets" on public.tickets for select
 create policy "Allow public insert/update on tickets" on public.tickets for all using (true);
 
 -- 7. Enable Supabase Realtime for live updates on queue screens
-alter publication supabase_realtime add table public.tickets;
-alter publication supabase_realtime add table public.doctors;
+do $$
+begin
+  alter publication supabase_realtime add table public.tickets;
+exception
+  when duplicate_object then null;
+end $$;
+
+do $$
+begin
+  alter publication supabase_realtime add table public.doctors;
+exception
+  when duplicate_object then null;
+end $$;
 
 -- 8. Seed Sample Data (Departments & Doctors)
 insert into public.departments (name, code, description) values
