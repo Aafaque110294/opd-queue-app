@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import Link from 'next/link';
 import { useSearchParams, useRouter, usePathname } from 'next/navigation';
 import { supabase } from '@/lib/supabase/client';
@@ -25,7 +25,11 @@ import {
   IndianRupee,
   LogOut,
   Phone,
-  FileText
+  FileText,
+  Download,
+  Search,
+  ChevronLeft,
+  ChevronRight
 } from 'lucide-react';
 import { Department, Doctor } from '@/lib/types';
 
@@ -42,7 +46,7 @@ interface QueueTicket {
   id: string;
   token_number: string;
   patient_name: string;
-  phone_number: string;
+  phone_number: string | null;
   patient_age?: number;
   patient_gender?: string;
   department_id: string;
@@ -52,10 +56,37 @@ interface QueueTicket {
   notes?: string;
   created_at: string;
   called_at?: string;
+  completed_at?: string | null;
+  paid_amount?: number | null;
+  payment_mode?: 'CASH' | 'UPI' | 'CARD' | 'OTHER' | 'NONE' | null;
   departments?: {
     name: string;
     code: string;
   };
+  doctors?: {
+    name: string;
+    room_number: string;
+  } | null;
+}
+
+const HISTORY_PAGE_SIZE = 10;
+
+function getLocalDateString(date = new Date()): string {
+  const localDate = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+  return localDate.toISOString().slice(0, 10);
+}
+
+function getLocalDateRange(startDate: string, endDate: string): { start: string; end: string } {
+  const [startYear, startMonth, startDay] = startDate.split('-').map(Number);
+  const [endYear, endMonth, endDay] = endDate.split('-').map(Number);
+  return {
+    start: new Date(startYear, startMonth - 1, startDay).toISOString(),
+    end: new Date(endYear, endMonth - 1, endDay + 1).toISOString(),
+  };
+}
+
+function formatCurrency(amount: number): string {
+  return `₹${amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 export default function ReceptionDeskPage() {
@@ -72,6 +103,19 @@ export default function ReceptionDeskPage() {
   const [queueTickets, setQueueTickets] = useState<QueueTicket[]>([]);
   const [currentPatient, setCurrentPatient] = useState<QueueTicket | null>(null);
   const [todayCompletedCount, setTodayCompletedCount] = useState<number>(0);
+  const [historyTickets, setHistoryTickets] = useState<QueueTicket[]>([]);
+  const [historyStartDate, setHistoryStartDate] = useState(getLocalDateString());
+  const [historyEndDate, setHistoryEndDate] = useState(getLocalDateString());
+  const [historySearch, setHistorySearch] = useState('');
+  const [historyPriority, setHistoryPriority] = useState<'all' | 'normal' | 'senior' | 'emergency'>('all');
+  const [historyPaymentMode, setHistoryPaymentMode] = useState<'all' | 'unrecorded' | 'CASH' | 'UPI' | 'CARD' | 'OTHER' | 'NONE'>('all');
+  const [historyPage, setHistoryPage] = useState(0);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState('');
+  const [showCompleteModal, setShowCompleteModal] = useState(false);
+  const [completionPaidAmount, setCompletionPaidAmount] = useState('');
+  const [completionPaymentMode, setCompletionPaymentMode] = useState<'CASH' | 'UPI' | 'CARD' | 'OTHER' | 'NONE'>('CASH');
+  const [completionError, setCompletionError] = useState('');
 
   const [opdTiming, setOpdTiming] = useState<string>('10:00 AM - 01:00 PM');
   const [opdShift, setOpdShift] = useState<string>('Morning');
@@ -234,6 +278,101 @@ export default function ReceptionDeskPage() {
     }
   };
 
+  const historyDoctorId = currentDoctor?.id;
+  const historyDepartmentId = currentDoctor?.department_id;
+  const isHistoryRangeInvalid = historyStartDate > historyEndDate;
+
+  const applyHistoryPreset = (preset: 'today' | 'this-month' | 'previous-month' | 'this-year') => {
+    const now = new Date();
+    const today = getLocalDateString(now);
+    let startDate = today;
+    let endDate = today;
+
+    if (preset === 'this-month') {
+      startDate = getLocalDateString(new Date(now.getFullYear(), now.getMonth(), 1));
+    } else if (preset === 'previous-month') {
+      startDate = getLocalDateString(new Date(now.getFullYear(), now.getMonth() - 1, 1));
+      endDate = getLocalDateString(new Date(now.getFullYear(), now.getMonth(), 0));
+    } else if (preset === 'this-year') {
+      startDate = getLocalDateString(new Date(now.getFullYear(), 0, 1));
+    }
+
+    setHistoryStartDate(startDate);
+    setHistoryEndDate(endDate);
+    setHistoryPage(0);
+  };
+
+  useEffect(() => {
+    if (!historyDoctorId || !historyDepartmentId || isHistoryRangeInvalid) return;
+
+    let isActive = true;
+    const { start, end } = getLocalDateRange(historyStartDate, historyEndDate);
+
+    const loadHistory = async () => {
+      setHistoryLoading(true);
+      setHistoryError('');
+
+      try {
+        const allHistory: QueueTicket[] = [];
+        const batchSize = 500;
+        let from = 0;
+        let hasMore = true;
+
+        while (hasMore) {
+          const { data, error } = await supabase
+            .from('tickets')
+            .select('*, departments(name, code), doctors(name, room_number)')
+            .eq('department_id', historyDepartmentId)
+            .eq('doctor_id', historyDoctorId)
+            .eq('status', 'completed')
+            .gte('completed_at', start)
+            .lt('completed_at', end)
+            .order('completed_at', { ascending: false })
+            .order('id', { ascending: false })
+            .range(from, from + batchSize - 1);
+
+          if (error) throw error;
+
+          const batch = (data as QueueTicket[] | null) || [];
+          allHistory.push(...batch);
+          hasMore = batch.length === batchSize;
+          from += batchSize;
+        }
+
+        if (isActive) setHistoryTickets(allHistory);
+      } catch (error: unknown) {
+        if (isActive) {
+          setHistoryError(error instanceof Error ? error.message : 'Unable to load consultation history.');
+        }
+      } finally {
+        if (isActive) setHistoryLoading(false);
+      }
+    };
+
+    void loadHistory();
+
+    const channel = supabase
+      .channel(`consultation-history-${historyDoctorId}-${historyStartDate}-${historyEndDate}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'tickets',
+          filter: `department_id=eq.${historyDepartmentId}`,
+        },
+        () => {
+          void loadHistory();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      isActive = false;
+      supabase.removeChannel(channel);
+    };
+  }, [historyDepartmentId, historyDoctorId, historyEndDate, historyStartDate, isHistoryRangeInvalid]);
+
   // ACTION 1: Single-Tap Call Next
   const handleCallNext = async () => {
     if (!currentDoctor) return;
@@ -274,11 +413,34 @@ export default function ReceptionDeskPage() {
     }
   };
 
+  const openCompletionModal = () => {
+    if (!currentPatient) return;
+
+    const priorPaymentMode = currentPatient.payment_mode
+      || (currentPatient.notes?.toUpperCase().includes('[UPI]') ? 'UPI' : 'CASH');
+    setCompletionPaidAmount(String(currentPatient.paid_amount ?? currentDoctor?.consultation_fee ?? 500));
+    setCompletionPaymentMode(priorPaymentMode);
+    setCompletionError('');
+    setErrorMsg('');
+    setShowCompleteModal(true);
+  };
+
   // ACTION 2: Complete Consultation
   const handleCompleteCurrent = async () => {
     if (!currentPatient || !currentDoctor) return;
 
+    const paidAmount = Number(completionPaidAmount);
+    if (!Number.isFinite(paidAmount) || paidAmount < 0) {
+      setCompletionError('Enter a valid amount paid, or enter 0 if no payment was collected.');
+      return;
+    }
+    if (completionPaymentMode === 'NONE' && paidAmount > 0) {
+      setCompletionError('Choose a payment method for the amount collected.');
+      return;
+    }
+
     setActionLoading(true);
+    setCompletionError('');
     setErrorMsg('');
     setSuccessMsg('');
 
@@ -288,16 +450,19 @@ export default function ReceptionDeskPage() {
         .update({
           status: 'completed',
           completed_at: new Date().toISOString(),
+          paid_amount: paidAmount,
+          payment_mode: paidAmount === 0 ? 'NONE' : completionPaymentMode,
         })
         .eq('id', currentPatient.id);
 
       if (error) throw error;
 
-      setSuccessMsg(`Completed token ${currentPatient.token_number}`);
+      setSuccessMsg(`Completed token ${currentPatient.token_number}; ${formatCurrency(paidAmount)} recorded.`);
+      setShowCompleteModal(false);
       setCurrentPatient(null);
       fetchDoctorQueue(currentDoctor.department_id, currentDoctor.id);
     } catch (err: any) {
-      setErrorMsg(err.message || 'Failed to complete consultation');
+      setCompletionError(err.message || 'Failed to complete consultation');
     } finally {
       setActionLoading(false);
     }
@@ -488,8 +653,78 @@ export default function ReceptionDeskPage() {
     }
   };
 
-  const consultationFee = currentDoctor?.consultation_fee || 500;
+  const consultationFee = currentDoctor?.consultation_fee ?? 500;
   const estimatedCollection = todayCompletedCount * consultationFee;
+
+  const filteredHistoryTickets = useMemo(() => {
+    const query = historySearch.trim().toLowerCase();
+
+    return historyTickets.filter((ticket) => {
+      if (historyPriority !== 'all' && ticket.priority !== historyPriority) return false;
+      if (historyPaymentMode === 'unrecorded' && (ticket.paid_amount != null || ticket.payment_mode != null)) return false;
+      if (historyPaymentMode !== 'all' && historyPaymentMode !== 'unrecorded' && ticket.payment_mode !== historyPaymentMode) return false;
+      if (!query) return true;
+
+      return [
+        ticket.token_number,
+        ticket.patient_name,
+        ticket.phone_number,
+        ticket.patient_age?.toString(),
+        ticket.patient_gender,
+        ticket.priority,
+        ticket.notes,
+      ].some((value) => value?.toLowerCase().includes(query));
+    });
+  }, [historyPaymentMode, historyPriority, historySearch, historyTickets]);
+
+  const historyPageCount = Math.max(1, Math.ceil(filteredHistoryTickets.length / HISTORY_PAGE_SIZE));
+  const visibleHistoryTickets = filteredHistoryTickets.slice(
+    historyPage * HISTORY_PAGE_SIZE,
+    (historyPage + 1) * HISTORY_PAGE_SIZE
+  );
+  const historyPaidTotal = filteredHistoryTickets.reduce((total, ticket) => total + (ticket.paid_amount ?? 0), 0);
+
+  const handleDownloadHistory = () => {
+    const columns = [
+      'Token',
+      'Patient Name',
+      'Phone',
+      'Age',
+      'Gender',
+      'Priority',
+      'Doctor',
+      'Room',
+      'Notes',
+      'Amount Paid',
+      'Payment Mode',
+      'Booking time',
+      'Completed time',
+    ];
+    const rows = filteredHistoryTickets.map((ticket) => [
+      ticket.token_number,
+      ticket.patient_name,
+      ticket.phone_number || '',
+      ticket.patient_age ?? '',
+      ticket.patient_gender || '',
+      ticket.priority,
+      ticket.doctors?.name || currentDoctor?.name || '',
+      ticket.doctors?.room_number || currentDoctor?.room_number || '',
+      ticket.notes || '',
+      ticket.paid_amount ?? '',
+      ticket.payment_mode || 'Not recorded',
+      new Date(ticket.created_at).toLocaleString(),
+      ticket.completed_at ? new Date(ticket.completed_at).toLocaleString() : '',
+    ]);
+    const escapeCsv = (value: string | number) => `"${String(value).replaceAll('"', '""')}"`;
+    const csv = [columns, ...rows].map((row) => row.map(escapeCsv).join(',')).join('\r\n');
+    const blob = new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `consultation-history-${historyStartDate}-to-${historyEndDate}.csv`;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  };
 
   return (
     <div className="min-h-screen bg-slate-100 flex flex-col justify-between">
@@ -766,7 +1001,7 @@ export default function ReceptionDeskPage() {
               </button>
 
               <button
-                onClick={handleCompleteCurrent}
+                onClick={openCompletionModal}
                 disabled={actionLoading || !currentPatient}
                 className="py-4 px-4 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm shadow-sm flex items-center justify-center gap-2 transition-all disabled:opacity-40 cursor-pointer"
               >
@@ -860,19 +1095,20 @@ export default function ReceptionDeskPage() {
                   <th className="px-6 py-3.5 text-left text-xs font-bold text-slate-500 uppercase">Gender</th>
                   <th className="px-6 py-3.5 text-left text-xs font-bold text-slate-500 uppercase">Priority</th>
                   <th className="px-6 py-3.5 text-left text-xs font-bold text-slate-500 uppercase">Notes / Tag</th>
+                  <th className="px-6 py-3.5 text-left text-xs font-bold text-slate-500 uppercase">Booking time</th>
                   <th className="px-6 py-3.5 text-right text-xs font-bold text-slate-500 uppercase">Slip</th>
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-slate-100">
                 {loading ? (
                   <tr>
-                    <td colSpan={8} className="py-12 text-center text-slate-400 text-sm">
+                    <td colSpan={9} className="py-12 text-center text-slate-400 text-sm">
                       Loading synchronized queue...
                     </td>
                   </tr>
                 ) : queueTickets.length === 0 ? (
                   <tr>
-                    <td colSpan={8} className="py-12 text-center text-slate-400 text-sm">
+                    <td colSpan={9} className="py-12 text-center text-slate-400 text-sm">
                       No patients waiting in queue. Click <span className="font-bold text-blue-600">"+ Add Walk-In"</span> to register an offline patient.
                     </td>
                   </tr>
@@ -937,6 +1173,9 @@ export default function ReceptionDeskPage() {
                           );
                         })()}
                       </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-xs text-slate-600">
+                        {new Date(t.created_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                      </td>
                       <td className="px-6 py-4 whitespace-nowrap text-right">
                         <button
                           onClick={() => setSelectedTicketForPrint(t)}
@@ -954,7 +1193,337 @@ export default function ReceptionDeskPage() {
           </div>
         </div>
 
+        {/* COMPLETED CONSULTATION HISTORY */}
+        <section className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden" aria-labelledby="history-title">
+          <div className="px-6 py-4 border-b border-slate-200 bg-slate-50/50 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h3 id="history-title" className="text-base font-bold text-slate-900">Consultation History</h3>
+              <p className="text-xs text-slate-500">
+                Completed visits for {currentDoctor?.name || 'this doctor'} · {new Date(`${historyStartDate}T00:00:00`).toLocaleDateString()} – {new Date(`${historyEndDate}T00:00:00`).toLocaleDateString()}
+              </p>
+            </div>
+            <div className="flex items-center justify-between gap-4 sm:justify-end">
+              <div className="text-right">
+                <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Recorded total</p>
+                <p className="text-sm font-black text-slate-900">{formatCurrency(historyPaidTotal)}</p>
+              </div>
+              <button
+                type="button"
+                onClick={handleDownloadHistory}
+                disabled={historyLoading || isHistoryRangeInvalid || filteredHistoryTickets.length === 0}
+                className="flex items-center gap-2 rounded-xl border border-slate-300 px-3 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Download className="h-4 w-4" />
+                Download CSV
+              </button>
+            </div>
+          </div>
+
+          <div className="space-y-3 border-b border-slate-200 p-4">
+            <div className="flex flex-col gap-3 xl:flex-row xl:items-end xl:justify-between">
+              <div className="grid grid-cols-2 gap-3 sm:max-w-md sm:flex-1">
+                <label className="block">
+                  <span className="mb-1 block text-[10px] font-bold uppercase tracking-wider text-slate-500">From</span>
+                  <input
+                    type="date"
+                    value={historyStartDate}
+                    max={historyEndDate < getLocalDateString() ? historyEndDate : getLocalDateString()}
+                    onChange={(event) => {
+                      if (event.target.value) setHistoryStartDate(event.target.value);
+                      setHistoryPage(0);
+                    }}
+                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-800 focus:border-blue-500 focus:outline-hidden focus:ring-2 focus:ring-blue-100"
+                  />
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-[10px] font-bold uppercase tracking-wider text-slate-500">To</span>
+                  <input
+                    type="date"
+                    value={historyEndDate}
+                    min={historyStartDate}
+                    max={getLocalDateString()}
+                    onChange={(event) => {
+                      if (event.target.value) setHistoryEndDate(event.target.value);
+                      setHistoryPage(0);
+                    }}
+                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-800 focus:border-blue-500 focus:outline-hidden focus:ring-2 focus:ring-blue-100"
+                  />
+                </label>
+              </div>
+
+              <div className="flex flex-wrap gap-2" role="group" aria-label="History date presets">
+                {([
+                  ['today', 'Today'],
+                  ['this-month', 'This month'],
+                  ['previous-month', 'Previous month'],
+                  ['this-year', 'This year'],
+                ] as const).map(([preset, label]) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    onClick={() => applyHistoryPreset(preset)}
+                    className="rounded-lg border border-slate-300 px-3 py-2 text-[11px] font-bold text-slate-600 hover:border-blue-300 hover:bg-blue-50 hover:text-blue-700"
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {isHistoryRangeInvalid && (
+              <p className="text-xs font-semibold text-rose-600">The start date must be on or before the end date.</p>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 gap-3 border-b border-slate-200 p-4 sm:grid-cols-2 xl:grid-cols-3">
+
+            <label className="block">
+              <span className="mb-1 block text-[10px] font-bold uppercase tracking-wider text-slate-500">Search</span>
+              <div className="relative">
+                <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="search"
+                  value={historySearch}
+                  onChange={(event) => {
+                    setHistorySearch(event.target.value);
+                    setHistoryPage(0);
+                  }}
+                  placeholder="Name, phone, or token"
+                  className="w-full rounded-xl border border-slate-300 bg-white py-2 pl-9 pr-3 text-xs text-slate-800 focus:border-blue-500 focus:outline-hidden focus:ring-2 focus:ring-blue-100"
+                />
+              </div>
+            </label>
+
+            <label className="block">
+              <span className="mb-1 block text-[10px] font-bold uppercase tracking-wider text-slate-500">Priority</span>
+              <select
+                value={historyPriority}
+                onChange={(event) => {
+                  setHistoryPriority(event.target.value as typeof historyPriority);
+                  setHistoryPage(0);
+                }}
+                className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-800 focus:border-blue-500 focus:outline-hidden focus:ring-2 focus:ring-blue-100"
+              >
+                <option value="all">All priorities</option>
+                <option value="normal">Normal</option>
+                <option value="senior">Senior</option>
+                <option value="emergency">Emergency</option>
+              </select>
+            </label>
+
+            <label className="block">
+              <span className="mb-1 block text-[10px] font-bold uppercase tracking-wider text-slate-500">Payment</span>
+              <select
+                value={historyPaymentMode}
+                onChange={(event) => {
+                  setHistoryPaymentMode(event.target.value as typeof historyPaymentMode);
+                  setHistoryPage(0);
+                }}
+                className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-800 focus:border-blue-500 focus:outline-hidden focus:ring-2 focus:ring-blue-100"
+              >
+                <option value="all">All payment types</option>
+                <option value="CASH">Cash</option>
+                <option value="UPI">UPI</option>
+                <option value="CARD">Card</option>
+                <option value="OTHER">Other</option>
+                <option value="NONE">Not paid</option>
+                <option value="unrecorded">Not recorded</option>
+              </select>
+            </label>
+          </div>
+
+          {historyError && (
+            <div className="m-4 rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs font-semibold text-rose-700">
+              {historyError}
+            </div>
+          )}
+
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-slate-200">
+              <thead className="bg-slate-50">
+                <tr>
+                  <th className="px-4 py-3 text-left text-[10px] font-bold uppercase text-slate-500">Token</th>
+                  <th className="px-4 py-3 text-left text-[10px] font-bold uppercase text-slate-500">Patient</th>
+                  <th className="px-4 py-3 text-left text-[10px] font-bold uppercase text-slate-500">Age / Gender</th>
+                  <th className="px-4 py-3 text-left text-[10px] font-bold uppercase text-slate-500">Priority</th>
+                  <th className="px-4 py-3 text-left text-[10px] font-bold uppercase text-slate-500">Doctor / Room</th>
+                  <th className="px-4 py-3 text-left text-[10px] font-bold uppercase text-slate-500">Notes</th>
+                  <th className="px-4 py-3 text-right text-[10px] font-bold uppercase text-slate-500">Amount Paid</th>
+                  <th className="px-4 py-3 text-left text-[10px] font-bold uppercase text-slate-500">Method</th>
+                  <th className="px-4 py-3 text-left text-[10px] font-bold uppercase text-slate-500">Booking time</th>
+                  <th className="px-4 py-3 text-left text-[10px] font-bold uppercase text-slate-500">Completed time</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 bg-white">
+                {isHistoryRangeInvalid ? (
+                  <tr><td colSpan={10} className="py-10 text-center text-xs text-rose-600">Choose a valid date range to view completed visits.</td></tr>
+                ) : historyLoading ? (
+                  <tr><td colSpan={10} className="py-10 text-center text-xs font-semibold text-slate-400">Loading consultation history...</td></tr>
+                ) : filteredHistoryTickets.length === 0 ? (
+                  <tr><td colSpan={10} className="py-10 text-center text-xs text-slate-400">No completed visits match this date and filter.</td></tr>
+                ) : visibleHistoryTickets.map((ticket) => {
+                  const cleanNotes = (ticket.notes || '')
+                    .replace(/\[\s*(UPI|CASH)\s*\]?/gi, '')
+                    .replace(/\[?\s*(Counter Walk-In|Online Self-Booked Token)\s*\]?/gi, '')
+                    .replace(/[\[\]]/g, '')
+                    .trim();
+
+                  return (
+                    <tr key={ticket.id} className="hover:bg-slate-50/80">
+                      <td className="whitespace-nowrap px-4 py-3 font-mono text-xs font-black text-slate-900">{ticket.token_number}</td>
+                      <td className="px-4 py-3">
+                        <div className="text-xs font-bold text-slate-900">{ticket.patient_name}</div>
+                        <div className="text-[10px] text-slate-500">{ticket.phone_number || 'No phone recorded'}</div>
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-3 text-xs text-slate-600">
+                        {ticket.patient_age ?? '—'} / <span className="capitalize">{ticket.patient_gender?.replaceAll('-', ' ') || '—'}</span>
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-3 text-xs capitalize text-slate-600">{ticket.priority}</td>
+                      <td className="whitespace-nowrap px-4 py-3 text-xs text-slate-600">
+                        {ticket.doctors?.name || currentDoctor?.name || '—'}<div className="text-[10px] text-slate-400">{ticket.doctors?.room_number || currentDoctor?.room_number || '—'}</div>
+                      </td>
+                      <td className="max-w-xs px-4 py-3 text-xs text-slate-600">{cleanNotes || '—'}</td>
+                      <td className="whitespace-nowrap px-4 py-3 text-right text-xs font-bold text-slate-900">
+                        {ticket.paid_amount == null ? 'Not recorded' : formatCurrency(ticket.paid_amount)}
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-3 text-xs text-slate-600">
+                        {ticket.payment_mode === 'NONE' ? 'Not paid' : ticket.payment_mode || 'Not recorded'}
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-3 text-xs text-slate-600">
+                        {new Date(ticket.created_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-3 text-xs text-slate-600">
+                        {ticket.completed_at ? new Date(ticket.completed_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="flex flex-col gap-2 border-t border-slate-200 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+            <p className="text-[11px] text-slate-500">
+              Showing {filteredHistoryTickets.length === 0 ? 0 : historyPage * HISTORY_PAGE_SIZE + 1}–{Math.min((historyPage + 1) * HISTORY_PAGE_SIZE, filteredHistoryTickets.length)} of {filteredHistoryTickets.length} visits
+            </p>
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                aria-label="Previous history page"
+                disabled={historyPage === 0 || historyLoading}
+                onClick={() => setHistoryPage((page) => Math.max(0, page - 1))}
+                className="rounded-lg border border-slate-300 p-2 text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+              >
+                <ChevronLeft className="h-4 w-4" />
+              </button>
+              <span className="min-w-16 text-center text-xs font-semibold text-slate-600">{historyPage + 1} / {historyPageCount}</span>
+              <button
+                type="button"
+                aria-label="Next history page"
+                disabled={historyPage + 1 >= historyPageCount || historyLoading}
+                onClick={() => setHistoryPage((page) => Math.min(historyPageCount - 1, page + 1))}
+                className="rounded-lg border border-slate-300 p-2 text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+              >
+                <ChevronRight className="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+        </section>
+
       </main>
+
+      {showCompleteModal && currentPatient && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4 backdrop-blur-xs"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="complete-consultation-title"
+        >
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              void handleCompleteCurrent();
+            }}
+            className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl"
+          >
+            <div className="mb-5 border-b border-slate-100 pb-4">
+              <span className="text-[10px] font-bold uppercase tracking-widest text-blue-600">Complete consultation</span>
+              <h3 id="complete-consultation-title" className="mt-1 text-lg font-black text-slate-900">
+                Record payment
+              </h3>
+              <p className="mt-1 text-xs text-slate-500">
+                {currentPatient.token_number} · {currentPatient.patient_name}
+              </p>
+            </div>
+
+            <div className="space-y-4">
+              <label className="block">
+                <span className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-700">Amount collected (₹)</span>
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  required
+                  value={completionPaidAmount}
+                  onChange={(event) => {
+                    setCompletionPaidAmount(event.target.value);
+                    if (Number(event.target.value) === 0) setCompletionPaymentMode('NONE');
+                    else if (completionPaymentMode === 'NONE') setCompletionPaymentMode('CASH');
+                  }}
+                  className="w-full rounded-xl border border-slate-300 bg-slate-50 px-3.5 py-3 text-sm font-semibold text-slate-900 focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+                />
+                <span className="mt-1 block text-[11px] text-slate-400">
+                  Consultation fee: {formatCurrency(consultationFee)}. Enter the actual amount received, or 0 if none was collected.
+                </span>
+              </label>
+
+              <label className="block">
+                <span className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-700">Payment method</span>
+                <select
+                  value={completionPaymentMode}
+                  onChange={(event) => {
+                    const mode = event.target.value as typeof completionPaymentMode;
+                    setCompletionPaymentMode(mode);
+                    if (mode === 'NONE') setCompletionPaidAmount('0');
+                    else if (Number(completionPaidAmount) === 0) setCompletionPaidAmount(String(consultationFee));
+                  }}
+                  className="w-full rounded-xl border border-slate-300 bg-slate-50 px-3.5 py-3 text-sm font-semibold text-slate-900 focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+                >
+                  <option value="CASH">Cash</option>
+                  <option value="UPI">UPI / QR</option>
+                  <option value="CARD">Card</option>
+                  <option value="OTHER">Other</option>
+                  <option value="NONE">No payment collected</option>
+                </select>
+              </label>
+
+              {completionError && (
+                <div className="rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs font-semibold text-rose-700">
+                  {completionError}
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  disabled={actionLoading}
+                  onClick={() => setShowCompleteModal(false)}
+                  className="rounded-xl border border-slate-200 px-4 py-2.5 text-xs font-bold text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={actionLoading}
+                  className="rounded-xl bg-blue-600 px-4 py-2.5 text-xs font-bold text-white shadow-sm hover:bg-blue-700 disabled:opacity-50"
+                >
+                  {actionLoading ? 'Saving...' : 'Save & Complete'}
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
+      )}
 
       {/* MODAL: + Add Walk-in (Counter Offline Registration) */}
       {showWalkinModal && (
