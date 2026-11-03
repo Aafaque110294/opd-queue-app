@@ -1,8 +1,9 @@
 'use client';
 
-import React, { useState, useEffect, useMemo, Suspense } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, Suspense } from 'react';
 import { useSearchParams } from 'next/navigation';
-import { supabase } from '@/lib/supabase/client';
+import type { User as SupabaseUser } from '@supabase/supabase-js';
+import { patientSupabase } from '@/lib/supabase/patient-client';
 import { formatOpdSessions, getOpdSessions, OpdSession } from '@/lib/opd-schedule';
 import { 
   Search, 
@@ -22,7 +23,8 @@ import {
   Users,
   Compass,
   Volume2,
-  Star
+  Star,
+  LogOut
 } from 'lucide-react';
 
 interface ClinicDirectoryRecord {
@@ -123,6 +125,8 @@ function getErrorMessage(error: unknown, fallback: string): string {
 }
 
 const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const PATIENT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+const PATIENT_ACTIVITY_STORAGE_KEY = 'opd-queue-patient-last-activity';
 
 function getLocalDateString(date = new Date()): string {
   const year = date.getFullYear();
@@ -166,6 +170,242 @@ function DoctorBookingDirectoryContent() {
   const [patientGender, setPatientGender] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
+
+  // Patient authentication
+  const [currentUser, setCurrentUser] = useState<SupabaseUser | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [authTab, setAuthTab] = useState<'login' | 'register'>('login');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState('');
+  const [authNotice, setAuthNotice] = useState('');
+
+  const applyAuthenticatedUser = useCallback((user: SupabaseUser | null) => {
+    setCurrentUser(user);
+    if (!user) return;
+
+    const fullName = user.user_metadata?.full_name;
+    const userPhone = user.user_metadata?.phone;
+    if (typeof fullName === 'string') setPatientName(fullName);
+    if (typeof userPhone === 'string') setPhone(userPhone);
+    setShowAuthModal(false);
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+    let receivedAuthEvent = false;
+
+    const { data: { subscription } } = patientSupabase.auth.onAuthStateChange((event, session) => {
+      receivedAuthEvent = true;
+      if (!isMounted) return;
+      if (event === 'SIGNED_IN') {
+        try {
+          window.localStorage.setItem(PATIENT_ACTIVITY_STORAGE_KEY, String(Date.now()));
+        } catch (error) {
+          console.error('Failed to persist patient session activity:', error);
+        }
+      }
+      applyAuthenticatedUser(session?.user ?? null);
+      setAuthReady(true);
+    });
+
+    patientSupabase.auth.getSession().then(({ data: { session }, error }) => {
+      if (error) throw error;
+      if (!isMounted) return;
+      if (!receivedAuthEvent) applyAuthenticatedUser(session?.user ?? null);
+      setAuthReady(true);
+    }).catch((err: unknown) => {
+      console.error('Failed to restore patient session:', err);
+      if (!isMounted) return;
+      setAuthError(getErrorMessage(err, 'Could not restore your sign-in session.'));
+      setAuthReady(true);
+    });
+
+    return () => {
+      isMounted = false;
+      subscription.unsubscribe();
+    };
+  }, [applyAuthenticatedUser]);
+
+  useEffect(() => {
+    if (!currentUser) return;
+
+    let timeoutId: number | undefined;
+    let isSigningOut = false;
+    let lastActivityAt = Date.now();
+
+    const readLastActivity = () => {
+      try {
+        const storedTimestamp = window.localStorage.getItem(PATIENT_ACTIVITY_STORAGE_KEY);
+        if (storedTimestamp) {
+          const timestamp = Number(storedTimestamp);
+          if (Number.isFinite(timestamp) && timestamp > 0) return timestamp;
+        }
+      } catch (error) {
+        console.error('Failed to read patient session activity:', error);
+      }
+      return lastActivityAt;
+    };
+
+    const recordActivity = (timestamp: number) => {
+      lastActivityAt = timestamp;
+      try {
+        window.localStorage.setItem(PATIENT_ACTIVITY_STORAGE_KEY, String(timestamp));
+      } catch (error) {
+        console.error('Failed to persist patient session activity:', error);
+      }
+    };
+
+    const expireIfIdle = async () => {
+      const remainingTime = PATIENT_IDLE_TIMEOUT_MS - (Date.now() - readLastActivity());
+      if (remainingTime > 0) {
+        scheduleExpiry();
+        return;
+      }
+      if (isSigningOut) return;
+
+      isSigningOut = true;
+      try {
+        const { error } = await patientSupabase.auth.signOut({ scope: 'local' });
+        if (error) throw error;
+        setAuthNotice('You were signed out after 30 minutes of inactivity. Sign in again to continue.');
+        setShowAuthModal(true);
+      } catch (error: unknown) {
+        console.error('Patient session timeout sign-out failed:', error);
+        setAuthError(getErrorMessage(error, 'Could not end the inactive patient session.'));
+        isSigningOut = false;
+      }
+    };
+
+    const scheduleExpiry = () => {
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+      const remainingTime = PATIENT_IDLE_TIMEOUT_MS - (Date.now() - readLastActivity());
+      if (remainingTime <= 0) {
+        void expireIfIdle();
+        return;
+      }
+      timeoutId = window.setTimeout(() => {
+        void expireIfIdle();
+      }, remainingTime);
+    };
+
+    const handleActivity = () => {
+      const now = Date.now();
+      if (now - readLastActivity() >= PATIENT_IDLE_TIMEOUT_MS) {
+        void expireIfIdle();
+        return;
+      }
+      recordActivity(now);
+      scheduleExpiry();
+    };
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === PATIENT_ACTIVITY_STORAGE_KEY) scheduleExpiry();
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') handleActivity();
+    };
+
+    try {
+      const storedActivity = window.localStorage.getItem(PATIENT_ACTIVITY_STORAGE_KEY);
+      const storedTimestamp = Number(storedActivity);
+      if (!storedActivity || !Number.isFinite(storedTimestamp) || storedTimestamp <= 0) {
+        recordActivity(lastActivityAt);
+      } else {
+        lastActivityAt = storedTimestamp;
+      }
+    } catch (error) {
+      console.error('Failed to initialize patient session activity:', error);
+    }
+    scheduleExpiry();
+    document.addEventListener('pointerdown', handleActivity, { passive: true });
+    document.addEventListener('keydown', handleActivity);
+    document.addEventListener('touchstart', handleActivity, { passive: true });
+    document.addEventListener('scroll', handleActivity, { passive: true });
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('storage', handleStorage);
+
+    return () => {
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+      document.removeEventListener('pointerdown', handleActivity);
+      document.removeEventListener('keydown', handleActivity);
+      document.removeEventListener('touchstart', handleActivity);
+      document.removeEventListener('scroll', handleActivity);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('storage', handleStorage);
+    };
+  }, [currentUser]);
+
+  const handlePatientAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthLoading(true);
+    setAuthError('');
+    setAuthNotice('');
+
+    try {
+      if (authTab === 'login') {
+        const { data, error } = await patientSupabase.auth.signInWithPassword({
+          email: authEmail.trim(),
+          password: authPassword,
+        });
+        if (error) throw error;
+        if (!data.user) throw new Error('Unable to sign in. Please try again.');
+        applyAuthenticatedUser(data.user);
+      } else {
+        const cleanPhone = phone.trim().replace(/\D/g, '');
+        if (!patientName.trim()) throw new Error('Please enter your full name.');
+        if (cleanPhone.length !== 10) throw new Error('Please enter a valid 10-digit mobile number.');
+
+        const { data, error } = await patientSupabase.auth.signUp({
+          email: authEmail.trim(),
+          password: authPassword,
+          options: {
+            data: {
+              full_name: patientName.trim(),
+              phone: cleanPhone,
+            },
+          },
+        });
+        if (error) throw error;
+        if (!data.user) throw new Error('Unable to create your account. Please try again.');
+        if (data.user.identities?.length === 0) {
+          throw new Error('This email is already registered. Please sign in instead.');
+        }
+
+        if (!data.session) {
+          setAuthPassword('');
+          setAuthNotice('Account created. Check your email to confirm your account, then sign in to continue.');
+          return;
+        }
+        applyAuthenticatedUser(data.user);
+      }
+
+      setAuthEmail('');
+      setAuthPassword('');
+      setShowAuthModal(false);
+    } catch (err: unknown) {
+      setAuthError(getErrorMessage(err, 'Authentication failed. Please check your details.'));
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handlePatientLogout = async () => {
+    setAuthLoading(true);
+    setAuthError('');
+    try {
+      const { error } = await patientSupabase.auth.signOut({ scope: 'local' });
+      if (error) throw error;
+      applyAuthenticatedUser(null);
+    } catch (err: unknown) {
+      console.error('Patient sign-out failed:', err);
+      setAuthError(getErrorMessage(err, 'Could not sign out. Please try again.'));
+    } finally {
+      setAuthLoading(false);
+    }
+  };
   
   // Confirmed slip / Active tracked ticket
   const [confirmedTicket, setConfirmedTicket] = useState<ConfirmedTicket | null>(null);
@@ -195,15 +435,15 @@ function DoctorBookingDirectoryContent() {
 
         // Safe parallel queries using allSettled so one table never breaks the others
         const [docRes, clinicsRes, deptsRes, ticketsRes, ratingsRes] = await Promise.allSettled([
-          supabase.from('doctors').select('*').order('created_at', { ascending: false }),
-          supabase.from('clinics').select('id, name, booking_fee'),
-          supabase.from('departments').select('id, name'),
-          supabase
+          patientSupabase.from('doctors').select('*').order('created_at', { ascending: false }),
+          patientSupabase.from('clinics').select('id, name, booking_fee'),
+          patientSupabase.from('departments').select('id, name'),
+          patientSupabase
             .from('tickets')
             .select('id, doctor_id, status, token_number, patient_name')
             .gte('created_at', `${today}T00:00:00.000Z`)
           ,
-          supabase
+          patientSupabase
             .from('tickets')
             .select('doctor_id, rating')
             .eq('status', 'completed')
@@ -300,7 +540,7 @@ function DoctorBookingDirectoryContent() {
 
       try {
         const today = new Date().toISOString().split('T')[0];
-        const { data, error } = await supabase
+        const { data, error } = await patientSupabase
           .from('tickets')
           .select('doctor_id, status, token_number, patient_name')
           .gte('created_at', `${today}T00:00:00.000Z`);
@@ -356,7 +596,7 @@ function DoctorBookingDirectoryContent() {
       }, 150);
     };
 
-    const channel = supabase
+    const channel = patientSupabase
       .channel('booking-directory-live-updates')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'doctors' }, () => {
         if (refreshTimeout) clearTimeout(refreshTimeout);
@@ -398,7 +638,7 @@ function DoctorBookingDirectoryContent() {
       window.clearInterval(metricsPoll);
       if (refreshTimeout) clearTimeout(refreshTimeout);
       if (metricRefreshTimeout) clearTimeout(metricRefreshTimeout);
-      void supabase.removeChannel(channel);
+      void patientSupabase.removeChannel(channel);
     };
   }, []);
 
@@ -412,7 +652,7 @@ function DoctorBookingDirectoryContent() {
     let isActive = true;
 
     async function loadTrackedDoctor() {
-      const { data, error } = await supabase
+      const { data, error } = await patientSupabase
         .from('doctors')
         .select('id, opd_status, broadcast_message')
         .eq('id', trackedDoctorId)
@@ -426,7 +666,7 @@ function DoctorBookingDirectoryContent() {
       if (isActive && data) setTrackedDoctor(data);
     }
 
-    const channel = supabase
+    const channel = patientSupabase
       .channel(`tracked-doctor-${trackedDoctorId}`)
       .on(
         'postgres_changes',
@@ -441,7 +681,7 @@ function DoctorBookingDirectoryContent() {
 
     return () => {
       isActive = false;
-      supabase.removeChannel(channel);
+      patientSupabase.removeChannel(channel);
     };
   }, [trackedDoctorId]);
 
@@ -454,7 +694,7 @@ function DoctorBookingDirectoryContent() {
       try {
         const today = new Date().toISOString().split('T')[0];
 
-        const { data: currentT } = await supabase
+        const { data: currentT } = await patientSupabase
           .from('tickets')
         .select('status, token_number, created_at, doctor_id, rating')
           .eq('id', activeTicketId)
@@ -463,7 +703,7 @@ function DoctorBookingDirectoryContent() {
         if (currentT) {
           setConfirmedTicket(prev => prev ? { ...prev, status: currentT.status, rating: currentT.rating } : null);
 
-          const { data: inCabin } = await supabase
+          const { data: inCabin } = await patientSupabase
             .from('tickets')
             .select('token_number')
             .eq('doctor_id', currentT.doctor_id)
@@ -473,7 +713,7 @@ function DoctorBookingDirectoryContent() {
 
           setNowServingToken(inCabin?.token_number || 'None');
 
-          const { count } = await supabase
+          const { count } = await patientSupabase
             .from('tickets')
             .select('*', { count: 'exact', head: true })
             .eq('doctor_id', currentT.doctor_id)
@@ -490,7 +730,7 @@ function DoctorBookingDirectoryContent() {
 
     syncLiveQueuePosition();
 
-    const channel = supabase
+    const channel = patientSupabase
       .channel(`live-ticket-${activeTicketId}`)
       .on(
         'postgres_changes',
@@ -502,7 +742,7 @@ function DoctorBookingDirectoryContent() {
       .subscribe();
 
     return () => {
-      supabase.removeChannel(channel);
+      patientSupabase.removeChannel(channel);
     };
   }, [confirmedTicketId]);
 
@@ -527,6 +767,10 @@ function DoctorBookingDirectoryContent() {
   const handleBooking = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedDoctor) return;
+    if (!currentUser) {
+      setShowAuthModal(true);
+      return;
+    }
 
     setSubmitting(true);
     setErrorMsg('');
@@ -544,7 +788,7 @@ function DoctorBookingDirectoryContent() {
         throw new Error('Please select the patient gender.');
       }
 
-      const { data: currentSchedule, error: scheduleError } = await supabase
+      const { data: currentSchedule, error: scheduleError } = await patientSupabase
         .from('doctors')
         .select('weekly_off_days, opd_holiday_dates')
         .eq('id', selectedDoctor.id)
@@ -562,7 +806,7 @@ function DoctorBookingDirectoryContent() {
 
       const today = new Date().toISOString().split('T')[0];
 
-      const { data: existingTicket } = await supabase
+      const { data: existingTicket } = await patientSupabase
         .from('tickets')
         .select('id, token_number, status')
         .eq('doctor_id', selectedDoctor.id)
@@ -575,7 +819,7 @@ function DoctorBookingDirectoryContent() {
         throw new Error(`You already have an active Token (#${existingTicket.token_number}) in queue today.`);
       }
 
-      const { data: ticketData, error: ticketError } = await supabase
+      const { data: ticketData, error: ticketError } = await patientSupabase
         .from('tickets')
         .insert([
           {
@@ -633,7 +877,7 @@ function DoctorBookingDirectoryContent() {
 
       const today = new Date().toISOString().split('T')[0];
 
-      const { data: ticket, error: ticketErr } = await supabase
+      const { data: ticket, error: ticketErr } = await patientSupabase
         .from('tickets')
         .select(`
           id,
@@ -692,7 +936,7 @@ function DoctorBookingDirectoryContent() {
     setRatingSaving(true);
     setRatingMessage('');
     try {
-      const { error } = await supabase
+      const { error } = await patientSupabase
         .from('tickets')
         .update({ rating })
         .eq('id', confirmedTicket.id)
@@ -718,7 +962,7 @@ function DoctorBookingDirectoryContent() {
     setCancelLoading(true);
 
     try {
-      const { error } = await supabase
+      const { error } = await patientSupabase
         .from('tickets')
         .update({ 
           status: 'skipped', 
@@ -756,36 +1000,51 @@ function DoctorBookingDirectoryContent() {
               </div>
             </div>
 
-            {/* TAB SELECTOR */}
-            <div className="flex bg-slate-900 p-1 rounded-2xl border border-slate-800 self-start sm:self-auto">
-              <button
-                type="button"
-                onClick={() => {
-                  setActiveTab('DIRECTORY');
-                  setConfirmedTicket(null);
-                }}
-                className={`px-4 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${
-                  activeTab === 'DIRECTORY'
-                    ? 'bg-blue-600 text-white shadow-sm'
-                    : 'text-slate-400 hover:text-white'
-                }`}
-              >
-                Book New Token
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setActiveTab('TRACKER');
-                  setConfirmedTicket(null);
-                }}
-                className={`px-4 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${
-                  activeTab === 'TRACKER'
-                    ? 'bg-blue-600 text-white shadow-sm'
-                    : 'text-slate-400 hover:text-white'
-                }`}
-              >
-                Track My Turn
-              </button>
+            <div className="flex items-center gap-3 self-start sm:self-auto">
+              {/* TAB SELECTOR */}
+              <div className="flex bg-slate-900 p-1 rounded-2xl border border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveTab('DIRECTORY');
+                    setConfirmedTicket(null);
+                  }}
+                  className={`px-4 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${
+                    activeTab === 'DIRECTORY'
+                      ? 'bg-blue-600 text-white shadow-sm'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  Book New Token
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveTab('TRACKER');
+                    setConfirmedTicket(null);
+                  }}
+                  className={`px-4 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${
+                    activeTab === 'TRACKER'
+                      ? 'bg-blue-600 text-white shadow-sm'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  Track My Turn
+                </button>
+              </div>
+
+              {currentUser && (
+                <button
+                  type="button"
+                  onClick={handlePatientLogout}
+                  disabled={authLoading}
+                  className="flex items-center gap-1.5 bg-slate-900 hover:bg-rose-950/50 text-slate-300 hover:text-rose-400 border border-slate-800 hover:border-rose-900/50 px-3.5 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer disabled:opacity-50"
+                  title="Log out of patient session"
+                >
+                  <LogOut className="h-3.5 w-3.5" />
+                  <span>{authLoading ? 'Signing out...' : 'Log Out'}</span>
+                </button>
+              )}
             </div>
           </div>
 
@@ -1226,15 +1485,22 @@ function DoctorBookingDirectoryContent() {
                           </div>
                         </div>
                       ) : null}
-                      <div className="mt-2 flex items-center justify-between rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 text-xs">
-                        <span className="flex items-center gap-1.5 font-medium text-slate-500">
-                          <Users className="h-3.5 w-3.5 text-blue-600" />
-                          <span>Waiting in line</span>
-                        </span>
-                        <span className="font-bold text-slate-900">
-                          {doc.waiting_count || 0} {(doc.waiting_count || 0) === 1 ? 'patient' : 'patients'}
-                        </span>
-                      </div>
+                      {(doc.waiting_count ?? 0) > 0 ? (
+                        <div className="mt-2 flex items-center justify-between rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 text-xs">
+                          <span className="flex items-center gap-1.5 font-medium text-slate-500">
+                            <Users className="h-3.5 w-3.5 text-blue-600" />
+                            <span>Waiting in line</span>
+                          </span>
+                          <span className="font-bold text-slate-900">
+                            {doc.waiting_count} {doc.waiting_count === 1 ? 'patient' : 'patients'}
+                          </span>
+                        </div>
+                      ) : (
+                        <div className="mt-2 flex items-center gap-1.5 rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-500">
+                          <Users className="h-3.5 w-3.5 text-slate-400" />
+                          <span>No patients waiting yet</span>
+                        </div>
+                      )}
                     </div>
 
                     {/* Action Button */}
@@ -1246,6 +1512,9 @@ function DoctorBookingDirectoryContent() {
                         onClick={() => {
                           setSelectedDoctor(doc);
                           setErrorMsg('');
+                          setAuthError('');
+                          setAuthNotice('');
+                          if (authReady && !currentUser) setShowAuthModal(true);
                         }}
                         className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 active:scale-95 text-white text-xs font-bold transition-all shadow-xs cursor-pointer flex items-center gap-1.5 disabled:cursor-not-allowed disabled:bg-slate-300 disabled:text-slate-600 disabled:shadow-none"
                       >
@@ -1262,7 +1531,7 @@ function DoctorBookingDirectoryContent() {
       </main>
 
       {/* QUICK BOOKING MODAL */}
-      {selectedDoctor && (
+      {selectedDoctor && currentUser && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 backdrop-blur-xs p-4 animate-in fade-in duration-150">
           <div className="bg-white rounded-3xl p-6 sm:p-8 max-w-md w-full shadow-2xl border border-slate-200">
             
@@ -1398,6 +1667,162 @@ function DoctorBookingDirectoryContent() {
               </span>
             </div>
 
+          </div>
+        </div>
+      )}
+
+      {(showAuthModal || (authReady && Boolean(selectedDoctor) && !currentUser)) && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 backdrop-blur-xs p-4 animate-in fade-in duration-150">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="patient-auth-title"
+            className="bg-white rounded-3xl p-6 sm:p-8 max-w-md w-full shadow-2xl border border-slate-200"
+          >
+            <div className="flex items-center justify-between mb-6 pb-3 border-b border-slate-100">
+              <div>
+                <h3 id="patient-auth-title" className="text-lg font-black text-slate-900">
+                  {authTab === 'login' ? 'Patient Login' : 'Create Patient Account'}
+                </h3>
+                <p className="text-xs text-slate-500">Sign in to book tokens and track live queues</p>
+              </div>
+              <button
+                type="button"
+                aria-label="Close patient sign-in"
+                onClick={() => {
+                  setShowAuthModal(false);
+                  setSelectedDoctor(null);
+                  setAuthPassword('');
+                  setAuthError('');
+                  setAuthNotice('');
+                }}
+                className="text-slate-400 hover:text-slate-600 p-1 cursor-pointer"
+              >
+                <XCircle className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 bg-slate-100 p-1 rounded-2xl mb-5">
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthTab('login');
+                  setAuthError('');
+                  setAuthNotice('');
+                }}
+                className={`py-2 text-xs font-bold rounded-xl transition-all cursor-pointer ${
+                  authTab === 'login' ? 'bg-white text-blue-600 shadow-xs' : 'text-slate-500'
+                }`}
+              >
+                Existing User
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthTab('register');
+                  setAuthError('');
+                  setAuthNotice('');
+                }}
+                className={`py-2 text-xs font-bold rounded-xl transition-all cursor-pointer ${
+                  authTab === 'register' ? 'bg-white text-blue-600 shadow-xs' : 'text-slate-500'
+                }`}
+              >
+                New Register
+              </button>
+            </div>
+
+            {authError && (
+              <div role="alert" className="mb-4 p-3 rounded-2xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-semibold">
+                {authError}
+              </div>
+            )}
+            {authNotice && (
+              <div role="status" className="mb-4 p-3 rounded-2xl bg-blue-50 border border-blue-200 text-blue-700 text-xs font-semibold">
+                {authNotice}
+              </div>
+            )}
+
+            <form onSubmit={handlePatientAuth} className="space-y-4">
+              {authTab === 'register' && (
+                <>
+                  <div>
+                    <label htmlFor="patient-auth-name" className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
+                      Full Name *
+                    </label>
+                    <input
+                      id="patient-auth-name"
+                      type="text"
+                      required
+                      autoComplete="name"
+                      value={patientName}
+                      onChange={(e) => setPatientName(e.target.value)}
+                      placeholder="Enter your full name"
+                      className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3.5 py-2.5 text-sm text-slate-900 focus:bg-white focus:ring-2 focus:ring-blue-600 focus:outline-hidden"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="patient-auth-phone" className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
+                      10-Digit Mobile Number *
+                    </label>
+                    <input
+                      id="patient-auth-phone"
+                      type="tel"
+                      required
+                      maxLength={10}
+                      autoComplete="tel"
+                      value={phone}
+                      onChange={(e) => setPhone(e.target.value)}
+                      placeholder="e.g. 9876543210"
+                      className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3.5 py-2.5 text-sm text-slate-900 focus:bg-white focus:ring-2 focus:ring-blue-600 focus:outline-hidden"
+                    />
+                  </div>
+                </>
+              )}
+
+              <div>
+                <label htmlFor="patient-auth-email" className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
+                  Email Address *
+                </label>
+                <input
+                  id="patient-auth-email"
+                  type="email"
+                  required
+                  autoComplete="email"
+                  value={authEmail}
+                  onChange={(e) => setAuthEmail(e.target.value)}
+                  placeholder="patient@example.com"
+                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3.5 py-2.5 text-sm text-slate-900 focus:bg-white focus:ring-2 focus:ring-blue-600 focus:outline-hidden"
+                />
+              </div>
+
+              <div>
+                <label htmlFor="patient-auth-password" className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
+                  Password *
+                </label>
+                <input
+                  id="patient-auth-password"
+                  type="password"
+                  required
+                  autoComplete={authTab === 'login' ? 'current-password' : 'new-password'}
+                  value={authPassword}
+                  onChange={(e) => setAuthPassword(e.target.value)}
+                  placeholder="Enter your password"
+                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3.5 py-2.5 text-sm text-slate-900 focus:bg-white focus:ring-2 focus:ring-blue-600 focus:outline-hidden"
+                />
+              </div>
+
+              <button
+                type="submit"
+                disabled={authLoading}
+                className="w-full mt-2 py-3.5 rounded-xl shadow-md text-xs font-black text-white bg-blue-600 hover:bg-blue-700 active:scale-95 disabled:opacity-50 transition-all cursor-pointer"
+              >
+                {authLoading
+                  ? 'Processing...'
+                  : authTab === 'login'
+                    ? 'Sign In & Continue Booking'
+                    : 'Register & Continue'}
+              </button>
+            </form>
           </div>
         </div>
       )}

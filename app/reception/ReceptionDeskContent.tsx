@@ -2302,40 +2302,6 @@ export default function ReceptionDeskPage() {
           </div>
         </div>
       )}
-      {/* MODAL: Confirm patient reactivation */}
-      {ticketToReactivate && (
-        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200">
-            <div className="flex flex-col items-center text-center">
-              <div className="w-10 h-10 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center">
-                <UserCheck className="w-5 h-5" />
-              </div>
-              <div className="mt-4">
-                <h3 className="text-base font-bold text-slate-900">Reactivate this patient?</h3>
-                <p className="text-xs leading-5 text-slate-500 mt-2">
-                  Token {ticketToReactivate.token_number} will be added back to the waiting queue.
-                </p>
-              </div>
-            </div>
-            <div className="flex justify-center gap-3 mt-6">
-              <button
-                type="button"
-                onClick={() => setTicketToReactivate(null)}
-                className="px-4 py-2.5 rounded-xl border border-slate-300 text-slate-700 text-xs font-bold hover:bg-slate-50 cursor-pointer"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={confirmReactivate}
-                className="px-4 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold shadow-md cursor-pointer"
-              >
-                Yes, Reactivate
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
