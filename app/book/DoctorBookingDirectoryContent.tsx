@@ -1107,9 +1107,9 @@ function DoctorBookingDirectoryContent() {
                   : 'Live updates active · Keep this screen open'}
               </p>
               {trackedDoctor && trackedDoctor.id === confirmedTicket.doctor_id && trackedDoctor.opd_status === 'PAUSED' && (
-                <div className="mt-4 p-3 bg-amber-500 text-white rounded-xl text-xs font-bold flex items-center gap-2 shadow-sm animate-pulse text-left">
-                  <Volume2 className="w-4 h-4 shrink-0" />
-                  <span>Notice: {trackedDoctor.broadcast_message || 'Doctor is temporarily delayed.'}</span>
+                <div className="mt-4 flex min-h-12 items-start gap-2 rounded-xl bg-amber-500 p-3 text-left text-xs font-bold leading-4 text-white shadow-sm animate-pulse">
+                  <Volume2 className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span className="min-w-0 break-words">Notice: {trackedDoctor.broadcast_message || 'Doctor is temporarily delayed.'}</span>
                 </div>
               )}
             </div>
@@ -1405,24 +1405,43 @@ function DoctorBookingDirectoryContent() {
                 {filteredDoctors.map((doc) => (
                   <div
                     key={doc.id}
-                    className="bg-white rounded-3xl p-5 border border-slate-200/90 shadow-xs hover:shadow-md transition-all flex flex-col justify-between"
+                    className="group relative h-full overflow-hidden rounded-3xl border border-slate-200/90 bg-white shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:border-blue-200 hover:shadow-lg"
                   >
+                    <div className="flex h-full flex-col justify-between p-5">
                     <div>
                       {/* Top badges */}
-                      <div className="flex items-start justify-between gap-2 mb-3">
-                        <span className="px-2.5 py-1 rounded-lg bg-blue-50 text-blue-700 font-bold text-[11px]">
+                      <div className="flex min-h-8 items-start justify-between gap-2 mb-3">
+                        <span className="flex min-h-7 max-w-[55%] items-center rounded-full border border-blue-100 bg-blue-50 px-2.5 py-1 text-[10px] font-extrabold uppercase tracking-wide leading-4 text-blue-700">
                           {doc.department_name}
                         </span>
                         
-                        <span className="px-2.5 py-1 rounded-lg bg-emerald-50 text-emerald-700 font-bold text-[11px] flex items-center gap-1">
+                        <span className="flex min-h-7 max-w-[45%] items-center gap-1 rounded-full border border-emerald-100 bg-emerald-50 px-2.5 py-1 text-[10px] font-extrabold leading-4 text-emerald-700">
                           <IndianRupee className="w-3 h-3" />
-                          <span>{doc.booking_fee === 0 ? 'Free Booking' : `₹${doc.booking_fee} Booking`}</span>
+                          <span className="truncate">{doc.booking_fee === 0 ? 'Free Booking' : `₹${doc.booking_fee} Booking`}</span>
                         </span>
                       </div>
 
                       {/* Doctor & Clinic */}
-                      <h3 className="text-base font-black text-slate-900 tracking-tight">{doc.name}</h3>
-                      <div className="mt-1 flex items-center gap-1.5" aria-label={`Doctor rating ${doc.rating.toFixed(1)} out of 5`}>
+                      <div className="grid min-h-12 grid-cols-[minmax(0,1fr)_minmax(7rem,42%)] items-center gap-3">
+                        <div className="flex min-w-0 items-center gap-2.5">
+                          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-600 to-indigo-600 text-white shadow-sm">
+                            <Stethoscope className="h-5 w-5" />
+                          </div>
+                          <h3
+                            className="min-w-0 text-base font-black leading-5 tracking-tight text-slate-900"
+                            title={doc.name}
+                          >
+                            <span className="line-clamp-2">{doc.name}</span>
+                          </h3>
+                        </div>
+                        <div className="flex min-w-0 items-center justify-end gap-1.5 text-right text-xs font-medium leading-4 text-slate-600">
+                          <span className="min-w-0 truncate" title={`${doc.clinic_name} · ${doc.room_number}`}>
+                            {doc.clinic_name} · {doc.room_number}
+                          </span>
+                          <Building2 className="h-3.5 w-3.5 shrink-0 text-blue-500" />
+                        </div>
+                      </div>
+                      <div className="mt-2 flex min-h-5 items-center gap-1.5 pl-[3.125rem]" aria-label={`Doctor rating ${doc.rating.toFixed(1)} out of 5`}>
                         <div className="flex items-center text-amber-400">
                           {[1, 2, 3, 4, 5].map((star) => (
                             <Star
@@ -1433,25 +1452,20 @@ function DoctorBookingDirectoryContent() {
                         </div>
                         <span className="text-[11px] font-bold text-slate-600">{doc.rating.toFixed(1)}/5</span>
                       </div>
-                      
-                      <div className="mt-1 flex items-center gap-1.5 text-xs text-slate-600 font-medium">
-                        <Building2 className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                        <span className="truncate">{doc.clinic_name} · {doc.room_number}</span>
-                      </div>
 
-                      <div className="mt-2.5 flex items-start gap-1.5 text-[11px] font-semibold text-slate-400">
-                        <Clock className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                        <div className="flex flex-wrap gap-1.5">
+                      <div className="mt-3 flex min-h-16 items-start gap-2 rounded-2xl border border-blue-100 bg-gradient-to-br from-blue-50/80 to-slate-50 p-2.5 text-[11px] font-semibold text-slate-400">
+                        <Clock className="mt-1 h-3.5 w-3.5 shrink-0 text-blue-600" />
+                        <div className="grid min-w-0 flex-1 gap-1.5">
                           {doc.opd_sessions.length > 0
                             ? doc.opd_sessions.map((session) => (
                                 <span
                                   key={session.shift}
-                                  className="rounded-md bg-slate-50 px-2 py-1 text-slate-600"
+                                  className="flex min-h-7 items-center rounded-md bg-white px-2 py-1 leading-4 text-slate-600 shadow-xs"
                                 >
                                   {formatOpdSessions([session])}
                                 </span>
                               ))
-                            : <span>{doc.opd_timing} ({doc.opd_shift})</span>}
+                            : <span className="flex min-h-7 items-center rounded-md bg-white px-2 py-1 leading-4 text-slate-600 shadow-xs">{doc.opd_timing} ({doc.opd_shift})</span>}
                         </div>
                       </div>
 
@@ -1462,15 +1476,15 @@ function DoctorBookingDirectoryContent() {
                       )}
 
                       {doc.opd_status === 'PAUSED' && (
-                        <div className="mt-3 p-2.5 bg-amber-50 border border-amber-200 rounded-xl text-xs font-bold text-amber-800 flex items-center gap-2">
-                          <span className="w-2 h-2 rounded-full bg-amber-500 animate-ping"></span>
-                          <span>OPD Paused: {doc.broadcast_message || 'Doctor is temporarily delayed.'}</span>
+                        <div className="mt-3 flex min-h-12 items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-2.5 text-xs font-bold leading-4 text-amber-800">
+                          <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-amber-500 animate-ping"></span>
+                          <span className="min-w-0 break-words">OPD Paused: {doc.broadcast_message || 'Doctor is temporarily delayed.'}</span>
                         </div>
                       )}
 
                       {/* Live Queue Broadcast */}
                       {doc.current_token ? (
-                        <div className="mt-3.5 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2.5 text-xs">
+                        <div className="mt-3.5 rounded-2xl border border-blue-200 bg-blue-50 px-3 py-2.5 text-xs">
                           <div className="flex items-center gap-1.5 font-bold text-blue-700">
                             <Users className="h-3.5 w-3.5" />
                             <span>Now consulting</span>
@@ -1486,7 +1500,7 @@ function DoctorBookingDirectoryContent() {
                         </div>
                       ) : null}
                       {(doc.waiting_count ?? 0) > 0 ? (
-                        <div className="mt-2 flex items-center justify-between rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 text-xs">
+                        <div className="mt-2 flex items-center justify-between rounded-2xl border border-slate-100 bg-slate-50 px-3 py-2 text-xs">
                           <span className="flex items-center gap-1.5 font-medium text-slate-500">
                             <Users className="h-3.5 w-3.5 text-blue-600" />
                             <span>Waiting in line</span>
@@ -1496,7 +1510,7 @@ function DoctorBookingDirectoryContent() {
                           </span>
                         </div>
                       ) : (
-                        <div className="mt-2 flex items-center gap-1.5 rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-500">
+                        <div className="mt-2 flex items-center gap-1.5 rounded-2xl border border-slate-100 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-500">
                           <Users className="h-3.5 w-3.5 text-slate-400" />
                           <span>No patients waiting yet</span>
                         </div>
@@ -1504,8 +1518,11 @@ function DoctorBookingDirectoryContent() {
                     </div>
 
                     {/* Action Button */}
-                    <div className="mt-5 pt-4 border-t border-slate-100 flex items-center justify-between">
-                      <span className="text-[11px] text-slate-400 font-medium">Instant Token</span>
+                    <div className="mt-5 flex items-center justify-between border-t border-slate-100 pt-4">
+                      <div>
+                        <span className="block text-[10px] font-extrabold uppercase tracking-wider text-slate-400">Quick booking</span>
+                        <span className="text-[11px] font-medium text-slate-500">Get your queue token</span>
+                      </div>
                       <button
                         type="button"
                         disabled={Boolean(getDoctorClosureReason(doc))}
@@ -1516,12 +1533,13 @@ function DoctorBookingDirectoryContent() {
                           setAuthNotice('');
                           if (authReady && !currentUser) setShowAuthModal(true);
                         }}
-                        className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 active:scale-95 text-white text-xs font-bold transition-all shadow-xs cursor-pointer flex items-center gap-1.5 disabled:cursor-not-allowed disabled:bg-slate-300 disabled:text-slate-600 disabled:shadow-none"
+                        className="flex cursor-pointer items-center gap-1.5 rounded-xl bg-blue-600 px-4 py-2.5 text-xs font-bold text-white shadow-sm transition-all hover:bg-blue-700 hover:shadow-md active:scale-95 disabled:cursor-not-allowed disabled:bg-slate-300 disabled:text-slate-600 disabled:shadow-none"
                       >
                         <span>{getDoctorClosureReason(doc) ? 'Closed Today' : 'Book Token'}</span>
                         {!getDoctorClosureReason(doc) && <ArrowRight className="w-3.5 h-3.5" />}
                       </button>
                     </div>
+                  </div>
                   </div>
                 ))}
               </div>
