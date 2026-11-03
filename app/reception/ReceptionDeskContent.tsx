@@ -1,7 +1,6 @@
 'use client';
 
 import React, { useState, useEffect, useMemo } from 'react';
-import Link from 'next/link';
 import { useSearchParams, useRouter, usePathname } from 'next/navigation';
 import { supabase } from '@/lib/supabase/client';
 
@@ -9,12 +8,10 @@ import {
   Users, 
   UserPlus, 
   Printer, 
-  ArrowLeft, 
   AlertCircle, 
   CheckCircle2, 
   X,
   Clock,
-  ShieldAlert,
   UserCheck,
   SkipForward,
   PauseCircle,
@@ -25,6 +22,9 @@ import {
   IndianRupee,
   LogOut,
   Phone,
+  UserRound,
+  Cake,
+  VenusAndMars,
   FileText,
   Download,
   Search,
@@ -32,12 +32,25 @@ import {
   ChevronRight
 } from 'lucide-react';
 import { Department, Doctor } from '@/lib/types';
+import {
+  formatCompactOpdSessions,
+  formatLegacyOpdTiming,
+  formatOpdSessions,
+  getOpdSessions,
+  OPD_TIME_OPTIONS,
+  OPD_SHIFTS,
+  OpdSession,
+} from '@/lib/opd-schedule';
+import { getErrorMessage } from '@/lib/error-message';
 
 interface ExtendedDoctor extends Doctor {
   clinic_name?: string;
   consultation_fee?: number;
   opd_timing?: string;
   opd_shift?: string;
+  opd_sessions?: OpdSession[] | null;
+  weekly_off_days?: string[] | null;
+  opd_holiday_dates?: string[] | null;
   broadcast_message?: string | null;
   opd_status?: 'LIVE' | 'PAUSED';
 }
@@ -59,6 +72,7 @@ interface QueueTicket {
   completed_at?: string | null;
   paid_amount?: number | null;
   payment_mode?: 'CASH' | 'UPI' | 'CARD' | 'OTHER' | 'NONE' | null;
+  rating?: number | null;
   departments?: {
     name: string;
     code: string;
@@ -70,6 +84,7 @@ interface QueueTicket {
 }
 
 const HISTORY_PAGE_SIZE = 10;
+const WEEKDAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
 
 function getLocalDateString(date = new Date()): string {
   const localDate = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
@@ -98,11 +113,15 @@ export default function ReceptionDeskPage() {
   const [departments, setDepartments] = useState<Department[]>([]);
   const [doctors, setDoctors] = useState<ExtendedDoctor[]>([]);
   const [selectedDoctorId, setSelectedDoctorId] = useState<string>('');
-  const [currentDoctor, setCurrentDoctor] = useState<ExtendedDoctor | null>(null);
+  const currentDoctor = useMemo(
+    () => doctors.find((doctor) => doctor.id === selectedDoctorId) || null,
+    [doctors, selectedDoctorId]
+  );
 
   const [queueTickets, setQueueTickets] = useState<QueueTicket[]>([]);
   const [skippedTickets, setSkippedTickets] = useState<QueueTicket[]>([]);
   const [currentPatient, setCurrentPatient] = useState<QueueTicket | null>(null);
+  const [activeReceptionSection, setActiveReceptionSection] = useState<'queue' | 'history'>('queue');
   const [todayCompletedCount, setTodayCompletedCount] = useState<number>(0);
   const [historyTickets, setHistoryTickets] = useState<QueueTicket[]>([]);
   const [historyStartDate, setHistoryStartDate] = useState(getLocalDateString());
@@ -118,11 +137,12 @@ export default function ReceptionDeskPage() {
   const [completionPaymentMode, setCompletionPaymentMode] = useState<'CASH' | 'UPI' | 'CARD' | 'OTHER' | 'NONE'>('CASH');
   const [completionError, setCompletionError] = useState('');
 
-  const [opdTiming, setOpdTiming] = useState<string>('10:00 AM - 01:00 PM');
-  const [opdShift, setOpdShift] = useState<string>('Morning');
   const [showTimingModal, setShowTimingModal] = useState<boolean>(false);
-  const [newTimingInput, setNewTimingInput] = useState<string>('');
-  const [newShiftInput, setNewShiftInput] = useState<string>('Morning');
+  const [timingError, setTimingError] = useState('');
+  const [newOpdSessions, setNewOpdSessions] = useState<OpdSession[]>([]);
+  const [newWeeklyOffDays, setNewWeeklyOffDays] = useState<string[]>([]);
+  const [newHolidayDates, setNewHolidayDates] = useState<string[]>([]);
+  const [newHolidayDate, setNewHolidayDate] = useState('');
   const [showLogoutModal, setShowLogoutModal] = useState<boolean>(false);
   const [ticketToReactivate, setTicketToReactivate] = useState<QueueTicket | null>(null);
 
@@ -176,14 +196,10 @@ export default function ReceptionDeskPage() {
             : docs[0].id;
           
           setSelectedDoctorId(targetDocId);
-          const initialDoc = docs.find(d => d.id === targetDocId) || docs[0];
-          setCurrentDoctor(initialDoc);
-          setOpdTiming(initialDoc.opd_timing || '10:00 AM - 01:00 PM');
-          setOpdShift(initialDoc.opd_shift || 'Morning');
         }
-      } catch (err: any) {
+      } catch (err: unknown) {
         console.error('Initialization error:', err);
-        setErrorMsg(err.message || 'Failed to load doctors and departments');
+        setErrorMsg(getErrorMessage(err, 'Failed to load doctors and departments'));
       } finally {
         setLoading(false);
       }
@@ -196,11 +212,8 @@ export default function ReceptionDeskPage() {
   useEffect(() => {
     if (!selectedDoctorId || doctors.length === 0) return;
     const doc = doctors.find((d) => d.id === selectedDoctorId) || null;
-    setCurrentDoctor(doc);
     if (doc) {
-      setOpdTiming(doc.opd_timing || '10:00 AM - 01:00 PM');
-      setOpdShift(doc.opd_shift || 'Morning');
-      fetchDoctorQueue(doc.department_id, doc.id);
+      void fetchDoctorQueue(doc.department_id, doc.id);
     }
   }, [selectedDoctorId, doctors]);
 
@@ -240,7 +253,7 @@ export default function ReceptionDeskPage() {
   }, [currentDoctor]);
 
   // Fetch queue items matching the active department/doctor
-  const fetchDoctorQueue = async (deptId: string, docId: string) => {
+  async function fetchDoctorQueue(deptId: string, docId: string) {
     try {
       const today = new Date().toISOString().split('T')[0];
 
@@ -277,10 +290,10 @@ export default function ReceptionDeskPage() {
 
       setQueueTickets(waiting);
       setSkippedTickets(skipped);
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error('Queue load error:', err);
     }
-  };
+  }
 
   const historyDoctorId = currentDoctor?.id;
   const historyDepartmentId = currentDoctor?.department_id;
@@ -410,8 +423,8 @@ export default function ReceptionDeskPage() {
 
       setSuccessMsg(`Called Token ${nextTicket.token_number} (${nextTicket.patient_name})`);
       fetchDoctorQueue(currentDoctor.department_id, currentDoctor.id);
-    } catch (err: any) {
-      setErrorMsg(err.message || 'Failed to call next patient');
+    } catch (err: unknown) {
+      setErrorMsg(getErrorMessage(err, 'Failed to call next patient'));
     } finally {
       setActionLoading(false);
     }
@@ -461,12 +474,13 @@ export default function ReceptionDeskPage() {
 
       if (error) throw error;
 
-      setSuccessMsg(`Completed token ${currentPatient.token_number}; ${formatCurrency(paidAmount)} recorded.`);
+      const recordedAmount = `₹${paidAmount.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
+      setSuccessMsg(`Consultation complete · ${currentPatient.token_number} · ${recordedAmount} recorded`);
       setShowCompleteModal(false);
       setCurrentPatient(null);
       fetchDoctorQueue(currentDoctor.department_id, currentDoctor.id);
-    } catch (err: any) {
-      setCompletionError(err.message || 'Failed to complete consultation');
+    } catch (err: unknown) {
+      setCompletionError(getErrorMessage(err, 'Failed to complete consultation'));
     } finally {
       setActionLoading(false);
     }
@@ -493,8 +507,8 @@ export default function ReceptionDeskPage() {
       setSuccessMsg(`Put Token ${currentPatient.token_number} on hold / skipped`);
       setCurrentPatient(null);
       fetchDoctorQueue(currentDoctor.department_id, currentDoctor.id);
-    } catch (err: any) {
-      setErrorMsg(err.message || 'Failed to hold ticket');
+    } catch (err: unknown) {
+      setErrorMsg(getErrorMessage(err, 'Failed to hold ticket'));
     } finally {
       setActionLoading(false);
     }
@@ -529,8 +543,8 @@ export default function ReceptionDeskPage() {
 
       setSuccessMsg(`Token ${ticket.token_number} has been reactivated and added to the waiting queue.`);
       await fetchDoctorQueue(currentDoctor.department_id, currentDoctor.id);
-    } catch (err: any) {
-      setErrorMsg(err.message || 'Failed to reactivate patient');
+    } catch (err: unknown) {
+      setErrorMsg(getErrorMessage(err, 'Failed to reactivate patient'));
     } finally {
       setActionLoading(false);
     }
@@ -540,6 +554,10 @@ export default function ReceptionDeskPage() {
   const handleAddWalkin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!patientName.trim() || !currentDoctor) return;
+    if (!phoneNumber.trim()) {
+      setErrorMsg('Please enter a phone number.');
+      return;
+    }
     const age = Number(patientAge);
     if (!Number.isInteger(age) || age < 0 || age > 120 || !patientGender) {
       setErrorMsg('Please enter a valid patient age and select a gender.');
@@ -564,7 +582,7 @@ export default function ReceptionDeskPage() {
           {
             token_number: prefix,
             patient_name: patientName.trim(),
-            phone_number: phoneNumber.trim() || null,
+            phone_number: phoneNumber.trim(),
             patient_age: age,
             patient_gender: patientGender,
             department_id: currentDoctor.department_id,
@@ -593,8 +611,8 @@ export default function ReceptionDeskPage() {
       setPaymentMode('CASH');
 
       fetchDoctorQueue(currentDoctor.department_id, currentDoctor.id);
-    } catch (err: any) {
-      setErrorMsg(err.message || 'Failed to create walk-in token');
+    } catch (err: unknown) {
+      setErrorMsg(getErrorMessage(err, 'Failed to create walk-in token'));
     } finally {
       setActionLoading(false);
     }
@@ -628,7 +646,6 @@ export default function ReceptionDeskPage() {
 
       if (error) throw error;
 
-      setCurrentDoctor(prev => prev ? { ...prev, opd_status: status, broadcast_message: message } : null);
       setDoctors(prev => prev.map(doctor =>
         doctor.id === currentDoctor.id
           ? { ...doctor, opd_status: status, broadcast_message: message }
@@ -641,8 +658,8 @@ export default function ReceptionDeskPage() {
       } else {
         setSuccessMsg('OPD resumed. Queue operations active.');
       }
-    } catch (err: any) {
-      setErrorMsg(err.message || 'Failed to update OPD status');
+    } catch (err: unknown) {
+      setErrorMsg(getErrorMessage(err, 'Failed to update OPD status'));
     } finally {
       setActionLoading(false);
     }
@@ -651,26 +668,57 @@ export default function ReceptionDeskPage() {
   // ACTION 6: Update Doctor OPD Timing & Shift
   const handleUpdateTiming = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!currentDoctor || !newTimingInput) return;
+    if (!currentDoctor) return;
+    if (newOpdSessions.length === 0) {
+      setTimingError('Add at least one consultation session.');
+      return;
+    }
+    const invalidSession = newOpdSessions.find((session) =>
+      !session.start_time ||
+      !session.end_time ||
+      session.start_time === session.end_time ||
+      (session.start_time > session.end_time && session.shift !== 'Night')
+    );
+    if (invalidSession) {
+      setTimingError(`${invalidSession.shift} OPD end time must be later than its start time. Check that the selected AM/PM values are correct.`);
+      return;
+    }
+
+    setTimingError('');
+    const firstSession = newOpdSessions[0];
+    const legacyTiming = formatLegacyOpdTiming(newOpdSessions);
     setActionLoading(true);
 
     try {
       const { error } = await supabase
         .from('doctors')
         .update({
-          opd_timing: newTimingInput,
-          opd_shift: newShiftInput,
+          opd_timing: legacyTiming,
+          opd_shift: firstSession.shift,
+          opd_sessions: newOpdSessions,
+          weekly_off_days: newWeeklyOffDays,
+          opd_holiday_dates: newHolidayDates,
         })
         .eq('id', currentDoctor.id);
 
       if (error) throw error;
 
-      setOpdTiming(newTimingInput);
-      setOpdShift(newShiftInput);
+      setDoctors((previousDoctors) => previousDoctors.map((doctor) =>
+        doctor.id === currentDoctor.id
+          ? {
+              ...doctor,
+              opd_timing: legacyTiming,
+              opd_shift: firstSession.shift,
+              opd_sessions: newOpdSessions,
+              weekly_off_days: newWeeklyOffDays,
+              opd_holiday_dates: newHolidayDates,
+            }
+          : doctor
+      ));
       setShowTimingModal(false);
-      setSuccessMsg(`Updated OPD timing for ${currentDoctor.name} to ${newTimingInput}`);
-    } catch (err: any) {
-      setErrorMsg(err.message || 'Failed to update timing');
+      setSuccessMsg(`Updated OPD schedule for ${currentDoctor.name}.`);
+    } catch (err: unknown) {
+      setTimingError(getErrorMessage(err, 'Failed to update the OPD schedule.'));
     } finally {
       setActionLoading(false);
     }
@@ -770,7 +818,7 @@ export default function ReceptionDeskPage() {
     <div className="min-h-screen bg-slate-100 flex flex-col justify-between">
       {/* Top Header */}
       <header className="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-xs">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 min-h-20 py-3 flex flex-col gap-3 sm:h-20 sm:flex-row sm:items-center sm:justify-between sm:py-0">
+        <div className="max-w-7xl mx-auto px-4 py-3 sm:px-6 lg:px-8 min-h-20 flex flex-col gap-3 lg:h-20 lg:flex-row lg:items-center lg:justify-between lg:py-0">
           <div className="flex min-w-0 items-center space-x-3">
             
             <div className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white shadow-md">
@@ -790,10 +838,10 @@ export default function ReceptionDeskPage() {
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center gap-3">
+          <div className="grid grid-cols-3 items-stretch gap-1.5 sm:gap-2 lg:flex lg:flex-wrap lg:items-center lg:gap-3">
             {/* Show Dropdown only if in Multi-Doctor Hospital mode */}
             {!isSoloClinicMode && (
-              <div className="flex items-center space-x-2 bg-slate-50 p-1.5 rounded-xl border border-slate-300">
+              <div className="col-span-3 flex min-w-0 items-center space-x-2 rounded-xl border border-slate-300 bg-slate-50 p-1.5 lg:col-span-1">
                 <Stethoscope className="w-4 h-4 text-slate-500 ml-1.5" />
                 <select
                   value={selectedDoctorId}
@@ -816,48 +864,61 @@ export default function ReceptionDeskPage() {
             {/* OPD Shift & Timing Badge */}
             <button
               onClick={() => {
-                setNewTimingInput(opdTiming);
-                setNewShiftInput(opdShift);
+                setTimingError('');
+                setNewOpdSessions(currentDoctor
+                  ? getOpdSessions(currentDoctor.opd_sessions, currentDoctor.opd_shift, currentDoctor.opd_timing)
+                  : []);
+                setNewWeeklyOffDays(currentDoctor?.weekly_off_days || []);
+                setNewHolidayDates(currentDoctor?.opd_holiday_dates || []);
+                setNewHolidayDate('');
                 setShowTimingModal(true);
               }}
-              className="flex items-center space-x-1.5 bg-blue-50 hover:bg-blue-100 border border-blue-200 text-blue-700 px-3 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer"
+              className="col-span-3 flex min-w-0 items-center justify-center gap-2 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-bold text-blue-700 transition-colors hover:bg-blue-100 cursor-pointer lg:col-span-1"
               title="Click to edit doctor OPD schedule"
             >
-              <Clock className="w-3.5 h-3.5 text-blue-600" />
-              <span>{opdShift}: {opdTiming}</span>
-              <span className="text-[10px] underline ml-1 text-blue-500">Edit</span>
+              <Clock className="h-3.5 w-3.5 shrink-0 text-blue-600" />
+              <span className="min-w-0 max-w-[min(34rem,45vw)] truncate text-left leading-4" title={currentDoctor
+                ? formatOpdSessions(getOpdSessions(currentDoctor.opd_sessions, currentDoctor.opd_shift, currentDoctor.opd_timing))
+                  || `${currentDoctor.opd_shift || 'Morning'}: ${currentDoctor.opd_timing || '10:00 AM - 01:00 PM'}`
+                : 'Set OPD hours'}>
+                {currentDoctor
+                  ? formatCompactOpdSessions(getOpdSessions(currentDoctor.opd_sessions, currentDoctor.opd_shift, currentDoctor.opd_timing))
+                    || `${currentDoctor.opd_shift || 'Morning'}: ${currentDoctor.opd_timing || '10:00 AM - 01:00 PM'}`
+                  : 'Set OPD hours'}
+              </span>
+              <span className="shrink-0 text-[10px] text-blue-500 underline">Edit</span>
             </button>
 
-                        {/* Emergency Broadcast / Pause OPD Button */}
+            {/* Emergency Broadcast / Pause OPD Button */}
             <button
               onClick={handleTogglePauseClick}
-              className={`flex items-center gap-2 px-4 py-2.5 rounded-xl text-xs font-bold transition-all shadow-xs cursor-pointer ${
+              className={`flex min-w-0 items-center justify-center gap-1 rounded-xl px-1.5 py-2 text-[10px] font-bold transition-all shadow-xs cursor-pointer sm:gap-1.5 sm:px-2.5 sm:py-2.5 sm:text-xs lg:gap-2 lg:px-4 ${
                 isOpdPaused
                   ? 'bg-amber-600 hover:bg-amber-700 text-white animate-pulse'
                   : 'bg-slate-200 hover:bg-slate-300 text-slate-700'
               }`}
             >
-              {isOpdPaused ? <PlayCircle className="w-4 h-4" /> : <PauseCircle className="w-4 h-4" />}
-              <span>{isOpdPaused ? 'Resume OPD' : 'Pause OPD'}</span>
+              {isOpdPaused ? <PlayCircle className="h-3.5 w-3.5 shrink-0 sm:h-4 sm:w-4" /> : <PauseCircle className="h-3.5 w-3.5 shrink-0 sm:h-4 sm:w-4" />}
+              <span className="truncate">{isOpdPaused ? 'Resume OPD' : 'Pause OPD'}</span>
             </button>
 
             {/* Quick Add Walk-in Button */}
             <button
               onClick={() => setShowWalkinModal(true)}
-              className="flex items-center space-x-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2.5 rounded-xl text-xs font-bold transition-colors shadow-md cursor-pointer"
+              className="flex min-w-0 items-center justify-center gap-1 rounded-xl bg-blue-600 px-1.5 py-2 text-[10px] font-bold text-white shadow-md transition-colors hover:bg-blue-700 cursor-pointer sm:gap-1.5 sm:px-2.5 sm:py-2.5 sm:text-xs lg:gap-2 lg:px-4"
             >
-              <UserPlus className="w-4 h-4" />
-              <span>+ Add Walk-In</span>
+              <UserPlus className="h-3.5 w-3.5 shrink-0 sm:h-4 sm:w-4" />
+              <span className="truncate">+ Add Walk-In</span>
             </button>
 
             {/* Log Out Button */}
             <button
               onClick={handleLogout}
-              className="flex items-center space-x-1.5 bg-slate-100 hover:bg-blue-50 hover:text-blue-600 text-slate-600 border border-slate-200 hover:border-blue-200 px-3 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer"
+              className="flex min-w-0 items-center justify-center gap-1 rounded-xl border border-slate-200 bg-slate-100 px-1.5 py-2 text-[10px] font-bold text-slate-600 transition-all hover:border-blue-200 hover:bg-blue-50 hover:text-blue-600 cursor-pointer sm:gap-1.5 sm:px-2.5 sm:py-2.5 sm:text-xs lg:px-3"
               title="Log Out of Clinic Session"
             >
-              <LogOut className="w-4 h-4" />
-              <span>Log Out</span>
+              <LogOut className="h-3.5 w-3.5 shrink-0 sm:h-4 sm:w-4" />
+              <span className="truncate">Log Out</span>
             </button>
           </div>
         </div>
@@ -901,23 +962,23 @@ export default function ReceptionDeskPage() {
           {/* Active Cabin Consultation Card */}
           <div className="lg:col-span-2 bg-white rounded-2xl border border-slate-200 p-6 shadow-sm flex flex-col justify-between">
             <div>
-              <div className="flex items-center justify-between pb-4 border-b border-slate-100">
-                <div className="flex items-center space-x-3">
-                  <span className="px-3 py-1 bg-emerald-100 text-emerald-800 text-xs font-black rounded-lg">
-                    {currentDoctor ? currentDoctor.room_number : 'Room 1'}
-                  </span>
-                  <div>
-                    <h2 className="text-lg font-bold text-slate-900">{currentDoctor?.name}</h2>
+              <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-slate-100">
+                <div className="flex min-w-0 items-center space-x-3">
+                  <div className="min-w-0">
+                    <h2 className="truncate text-lg font-bold text-slate-900">{currentDoctor?.name || 'Doctor'}</h2>
                     <p className="text-xs text-slate-500">Currently in consultation</p>
                   </div>
+                  <span className="shrink-0 rounded-lg bg-emerald-100 px-3 py-1 text-xs font-black text-emerald-800">
+                    {currentDoctor ? currentDoctor.room_number : 'Room 1'}
+                  </span>
                 </div>
 
                 {currentPatient ? (
-                  <span className="px-3 py-1 rounded-full text-xs font-black bg-emerald-100 text-emerald-800 animate-pulse">
+                  <span className="shrink-0 rounded-full bg-emerald-100 px-3 py-1 text-xs font-black text-emerald-800 animate-pulse">
                     Inside Cabin
                   </span>
                 ) : (
-                  <span className="px-3 py-1 rounded-full text-xs font-bold bg-slate-100 text-slate-500">
+                  <span className="shrink-0 rounded-full bg-slate-100 px-3 py-1 text-xs font-bold text-slate-500">
                     Cabin Ready / Empty
                   </span>
                 )}
@@ -969,12 +1030,13 @@ export default function ReceptionDeskPage() {
 
                       {/* Patient Name & Metadata */}
                       <div>
-                        <h3 className="text-2xl font-black text-slate-900 tracking-tight">
+                        <h3 className="flex items-center gap-2 text-2xl font-black text-slate-900 tracking-tight">
+                          <UserRound className="h-5 w-5 text-slate-400" />
                           {currentPatient.patient_name}
                         </h3>
 
-                        {/* Metadata Row: Phone and Timestamp */}
-                        <div className="flex flex-wrap items-center gap-3 text-xs mt-1.5">
+                        {/* Patient details */}
+                        <div className="mt-2 grid grid-cols-1 gap-x-6 gap-y-2 text-xs sm:grid-cols-2">
                           <span className="flex items-center gap-1.5">
                             <Phone className="w-3.5 h-3.5 text-slate-400" />
                             <span className="font-semibold text-slate-900">
@@ -982,23 +1044,18 @@ export default function ReceptionDeskPage() {
                             </span>
                           </span>
 
-                          <span className="text-slate-300">•</span>
-
-                          <span className="font-semibold text-slate-900">
-                            Age: {currentPatient.patient_age ?? '—'}
+                          <span className="flex items-center gap-1.5 font-semibold text-slate-900">
+                            <Cake className="w-3.5 h-3.5 text-slate-400" />
+                            {currentPatient.patient_age ?? '—'}
                           </span>
 
-                          <span className="text-slate-300">•</span>
-
-                          <span className="font-semibold capitalize text-slate-900">
-                            Gender: {currentPatient.patient_gender?.replaceAll('-', ' ') || '—'}
+                          <span className="flex items-center gap-1.5 font-semibold capitalize text-slate-900">
+                            <VenusAndMars className="w-3.5 h-3.5 text-slate-400" />
+                            {currentPatient.patient_gender?.replaceAll('-', ' ') || '—'}
                           </span>
-                          
-                          <span className="text-slate-300">•</span>
-                          
+
                           <span className="flex items-center gap-1.5">
                             <Clock className="w-3.5 h-3.5 text-slate-400" />
-                            <span className="text-slate-500 font-medium">Called</span>
                             <span className="font-semibold text-slate-900">
                               {currentPatient.called_at
                                 ? new Date(currentPatient.called_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
@@ -1112,7 +1169,48 @@ export default function ReceptionDeskPage() {
 
         </div>
 
+        <div className="flex justify-center">
+          <div className="inline-flex w-full max-w-lg rounded-2xl border border-slate-200 bg-slate-100 p-1.5 shadow-inner" role="tablist" aria-label="Reception sections">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeReceptionSection === 'queue'}
+              onClick={() => setActiveReceptionSection('queue')}
+              className={`flex flex-1 items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-bold transition-all ${
+                activeReceptionSection === 'queue'
+                  ? 'bg-white text-blue-700 shadow-md ring-1 ring-blue-100'
+                  : 'text-slate-600 hover:bg-white/70 hover:text-slate-900'
+              }`}
+            >
+              <Users className="h-4 w-4" />
+              <span>Waiting Queue</span>
+              <span className={`rounded-full px-2 py-0.5 text-xs ${
+                activeReceptionSection === 'queue'
+                  ? 'bg-blue-100 text-blue-700'
+                  : 'bg-slate-200 text-slate-600'
+              }`}>
+                {queueTickets.length + skippedTickets.length}
+              </span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeReceptionSection === 'history'}
+              onClick={() => setActiveReceptionSection('history')}
+              className={`flex flex-1 items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-bold transition-all ${
+                activeReceptionSection === 'history'
+                  ? 'bg-white text-blue-700 shadow-md ring-1 ring-blue-100'
+                  : 'text-slate-600 hover:bg-white/70 hover:text-slate-900'
+              }`}
+            >
+              <FileText className="h-4 w-4" />
+              History
+            </button>
+          </div>
+        </div>
+
         {/* BOTTOM ROW: Synchronized Waiting List */}
+        {activeReceptionSection === 'queue' && (
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
           <div className="px-6 py-4 border-b border-slate-200 bg-slate-50/50 flex justify-between items-center">
             <div>
@@ -1153,7 +1251,7 @@ export default function ReceptionDeskPage() {
                 ) : queueTickets.length === 0 && skippedTickets.length === 0 ? (
                   <tr>
                     <td colSpan={10} className="py-12 text-center text-slate-400 text-sm">
-                      No patients waiting in queue. Click <span className="font-bold text-blue-600">"+ Add Walk-In"</span> to register an offline patient.
+                      No patients waiting in queue. Click <span className="font-bold text-blue-600">&quot;+ Add Walk-In&quot;</span> to register an offline patient.
                     </td>
                   </tr>
                 ) : (
@@ -1253,8 +1351,10 @@ export default function ReceptionDeskPage() {
             </table>
           </div>
         </div>
+        )}
 
         {/* COMPLETED CONSULTATION HISTORY */}
+        {activeReceptionSection === 'history' && (
         <section className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden" aria-labelledby="history-title">
           <div className="px-6 py-4 border-b border-slate-200 bg-slate-50/50 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
@@ -1490,6 +1590,7 @@ export default function ReceptionDeskPage() {
             </div>
           </div>
         </section>
+        )}
 
       </main>
 
@@ -1624,10 +1725,11 @@ export default function ReceptionDeskPage() {
 
               <div>
                 <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                  Mobile Number (Optional)
+                  Mobile Number *
                 </label>
                 <input
                   type="tel"
+                  required
                   value={phoneNumber}
                   onChange={(e) => setPhoneNumber(e.target.value)}
                   placeholder="10-digit mobile number"
@@ -1677,7 +1779,12 @@ export default function ReceptionDeskPage() {
                   </label>
                   <select
                     value={priority}
-                    onChange={(e) => setPriority(e.target.value as any)}
+                    onChange={(e) => {
+                      const selectedPriority = e.target.value;
+                      if (selectedPriority === 'normal' || selectedPriority === 'senior' || selectedPriority === 'emergency') {
+                        setPriority(selectedPriority);
+                      }
+                    }}
                     className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-slate-800 focus:ring-2 focus:ring-blue-500"
                   >
                     <option value="normal">Normal</option>
@@ -1692,7 +1799,11 @@ export default function ReceptionDeskPage() {
                   </label>
                   <select
                     value={paymentMode}
-                    onChange={(e) => setPaymentMode(e.target.value as any)}
+                    onChange={(e) => {
+                      if (e.target.value === 'CASH' || e.target.value === 'UPI') {
+                        setPaymentMode(e.target.value);
+                      }
+                    }}
                     className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-slate-800 focus:ring-2 focus:ring-blue-500"
                   >
                     <option value="CASH">Cash (₹{consultationFee})</option>
@@ -1777,19 +1888,81 @@ export default function ReceptionDeskPage() {
         </div>
       )}
 
+      {ticketToReactivate && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-xs">
+          <div
+            className="w-full max-w-sm rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="reactivate-ticket-title"
+          >
+            <div className="mb-5 flex items-start justify-between gap-4">
+              <div>
+                <h3 id="reactivate-ticket-title" className="text-lg font-black text-slate-900">
+                  Reactivate patient?
+                </h3>
+                <p className="mt-1 text-xs text-slate-500">
+                  Token {ticketToReactivate.token_number} will be moved back to the waiting queue.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setTicketToReactivate(null)}
+                className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+                aria-label="Close reactivation dialog"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+            <div className="flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setTicketToReactivate(null)}
+                disabled={actionLoading}
+                className="rounded-xl border border-slate-300 px-4 py-2.5 text-xs font-bold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void confirmReactivate()}
+                disabled={actionLoading}
+                className="rounded-xl bg-blue-600 px-4 py-2.5 text-xs font-bold text-white shadow-md hover:bg-blue-700 disabled:opacity-50"
+              >
+                {actionLoading ? 'Reactivating...' : 'Reactivate'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
             {/* MODAL: Update Doctor OPD Timing */}
       {showTimingModal && (
         <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl border border-slate-200">
+          <div className="bg-white rounded-2xl max-w-sm w-full max-h-[90vh] overflow-y-auto p-5 sm:p-6 shadow-2xl border border-slate-200">
             <div className="flex justify-between items-center mb-4 pb-2 border-b border-slate-100">
               <h3 className="text-base font-black text-slate-900">Set OPD Schedule</h3>
               <button 
-                onClick={() => setShowTimingModal(false)} 
+                onClick={() => {
+                  setShowTimingModal(false);
+                  setTimingError('');
+                }}
+                aria-label="Close OPD schedule"
                 className="text-slate-400 hover:text-slate-600 p-1 cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
+
+            {timingError && (
+              <div
+                role="alert"
+                className="mb-4 flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs font-semibold text-rose-700"
+              >
+                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-500" />
+                <span>{timingError}</span>
+              </div>
+            )}
 
             <form onSubmit={handleUpdateTiming} className="space-y-4">
               <div>
@@ -1805,40 +1978,206 @@ export default function ReceptionDeskPage() {
               </div>
 
               <div>
-                <label className="block text-xs font-bold text-slate-700 uppercase mb-1">
-                  Shift
-                </label>
-                <select
-                  value={newShiftInput}
-                  onChange={(e) => setNewShiftInput(e.target.value)}
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-slate-800"
-                >
-                  <option value="Morning">Morning OPD</option>
-                  <option value="Afternoon">Afternoon OPD</option>
-                  <option value="Evening">Evening OPD</option>
-                  <option value="Night">Night Emergency</option>
-                </select>
+                <div className="mb-2">
+                  <h4 className="text-xs font-bold text-slate-700 uppercase">Consultation Sessions</h4>
+                  <p className="mt-1 text-[11px] text-slate-400">Add a shift, then set its start and end time.</p>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  {OPD_SHIFTS.map((shift) => {
+                    const isAdded = newOpdSessions.some((session) => session.shift === shift);
+                    return (
+                      <button
+                        key={shift}
+                        type="button"
+                        disabled={isAdded}
+                        onClick={() => {
+                          setTimingError('');
+                          const defaultTimes: Record<typeof shift, [string, string]> = {
+                            Morning: ['09:00', '12:00'],
+                            Afternoon: ['13:00', '16:00'],
+                            Evening: ['17:00', '20:30'],
+                            Night: ['20:00', '23:00'],
+                          };
+                          const [start_time, end_time] = defaultTimes[shift];
+                          setNewOpdSessions((sessions) => [...sessions, { shift, start_time, end_time }]
+                            .sort((first, second) => OPD_SHIFTS.indexOf(first.shift) - OPD_SHIFTS.indexOf(second.shift)));
+                        }}
+                        className="rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-bold text-blue-700 hover:bg-blue-100 disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400"
+                      >
+                        {isAdded ? `${shift} added` : `+ Add ${shift}`}
+                      </button>
+                    );
+                  })}
+                </div>
+                <div className="mt-3 space-y-3">
+                  {newOpdSessions.map((session, index) => (
+                    <div key={session.shift} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                      <div className="mb-2 flex items-center justify-between">
+                        <h5 className="text-xs font-bold text-slate-800">{session.shift} OPD</h5>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setTimingError('');
+                            setNewOpdSessions((sessions) => sessions.filter((item) => item.shift !== session.shift));
+                          }}
+                          aria-label={`Remove ${session.shift} session`}
+                          className="rounded-lg p-1 text-slate-400 hover:bg-white hover:text-rose-600"
+                        >
+                          <X className="h-4 w-4" />
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-2 gap-3">
+                        <label className="text-[11px] font-semibold text-slate-600">
+                          Start time
+                          <select
+                            required
+                            value={session.start_time}
+                            onChange={(event) => {
+                              setTimingError('');
+                              setNewOpdSessions((sessions) => sessions.map((item, itemIndex) =>
+                                itemIndex === index ? { ...item, start_time: event.target.value } : item
+                              ));
+                            }}
+                            className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2.5 py-2 text-xs font-semibold text-slate-900 focus:ring-2 focus:ring-blue-500"
+                          >
+                            {OPD_TIME_OPTIONS.map(({ value, label }) => (
+                              <option key={value} value={value}>{label}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="text-[11px] font-semibold text-slate-600">
+                          End time
+                          <select
+                            required
+                            value={session.end_time}
+                            onChange={(event) => {
+                              setTimingError('');
+                              setNewOpdSessions((sessions) => sessions.map((item, itemIndex) =>
+                                itemIndex === index ? { ...item, end_time: event.target.value } : item
+                              ));
+                            }}
+                            className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2.5 py-2 text-xs font-semibold text-slate-900 focus:ring-2 focus:ring-blue-500"
+                          >
+                            {OPD_TIME_OPTIONS.map(({ value, label }) => (
+                              <option key={value} value={value}>{label}</option>
+                            ))}
+                          </select>
+                        </label>
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </div>
 
               <div>
-                <label className="block text-xs font-bold text-slate-700 uppercase mb-1">
-                  Consultation Hours
+                <label htmlFor="weekly-off-day" className="block text-xs font-bold text-slate-700 uppercase mb-1">
+                  Weekly Off Days
                 </label>
-                <input
-                  type="text"
-                  required
-                  value={newTimingInput}
-                  onChange={(e) => setNewTimingInput(e.target.value)}
-                  placeholder="e.g. 10:30 AM - 02:00 PM"
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-900 focus:ring-2 focus:ring-blue-500"
-                />
-                <p className="text-[11px] text-slate-400 mt-1">Receptionist can modify this if doctor is delayed.</p>
+                <select
+                  id="weekly-off-day"
+                  value=""
+                  onChange={(event) => {
+                    setTimingError('');
+                    const selectedDay = event.target.value;
+                    if (selectedDay && !newWeeklyOffDays.includes(selectedDay)) {
+                      setNewWeeklyOffDays((days) => [...days, selectedDay].sort(
+                        (firstDay, secondDay) => WEEKDAYS.indexOf(firstDay) - WEEKDAYS.indexOf(secondDay)
+                      ));
+                    }
+                  }}
+                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-xs font-semibold text-slate-900 focus:ring-2 focus:ring-blue-500"
+                >
+                  <option value="">Select a day to add</option>
+                  {WEEKDAYS.filter((day) => !newWeeklyOffDays.includes(day)).map((day) => (
+                    <option key={day} value={day}>{day}</option>
+                  ))}
+                </select>
+                {newWeeklyOffDays.length > 0 ? (
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {newWeeklyOffDays.map((day) => (
+                      <button
+                        key={day}
+                        type="button"
+                        onClick={() => {
+                          setTimingError('');
+                          setNewWeeklyOffDays((days) => days.filter((offDay) => offDay !== day));
+                        }}
+                        aria-label={`Remove ${day} as a weekly off day`}
+                        className="rounded-lg border border-slate-200 bg-slate-100 px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-200"
+                      >
+                        {day} ×
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="mt-1 text-[11px] text-slate-400">No weekly off days selected.</p>
+                )}
+              </div>
+
+              <div>
+                <label htmlFor="opd-holiday-date" className="block text-xs font-bold text-slate-700 uppercase mb-1">
+                  Holidays
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    id="opd-holiday-date"
+                    type="date"
+                    min={getLocalDateString()}
+                    value={newHolidayDate}
+                    onChange={(event) => setNewHolidayDate(event.target.value)}
+                    className="min-w-0 flex-1 bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-900 focus:ring-2 focus:ring-blue-500"
+                  />
+                  <button
+                    type="button"
+                    disabled={
+                      !newHolidayDate ||
+                      newHolidayDate < getLocalDateString() ||
+                      newHolidayDates.includes(newHolidayDate)
+                    }
+                    onClick={() => {
+                      if (
+                        !newHolidayDate ||
+                        newHolidayDate < getLocalDateString() ||
+                        newHolidayDates.includes(newHolidayDate)
+                      ) return;
+                      setTimingError('');
+                      setNewHolidayDates((dates) => [...dates, newHolidayDate].sort());
+                      setNewHolidayDate('');
+                    }}
+                    className="rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-bold text-blue-700 hover:bg-blue-100 disabled:opacity-50"
+                  >
+                    Add date
+                  </button>
+                </div>
+                {newHolidayDates.length > 0 ? (
+                  <div className="mt-2 flex max-h-24 flex-wrap gap-2 overflow-y-auto">
+                    {newHolidayDates.map((holidayDate) => (
+                      <button
+                        key={holidayDate}
+                        type="button"
+                        onClick={() => {
+                          setTimingError('');
+                          setNewHolidayDates((dates) => dates.filter((date) => date !== holidayDate));
+                        }}
+                        aria-label={`Remove holiday on ${new Date(`${holidayDate}T00:00:00`).toLocaleDateString()}`}
+                        className="rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-800 hover:bg-amber-100"
+                      >
+                        {new Date(`${holidayDate}T00:00:00`).toLocaleDateString()} ×
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="mt-1 text-[11px] text-slate-400">No additional holidays scheduled.</p>
+                )}
               </div>
 
               <div className="flex justify-end gap-2 pt-2">
                 <button
                   type="button"
-                  onClick={() => setShowTimingModal(false)}
+                  onClick={() => {
+                    setShowTimingModal(false);
+                    setTimingError('');
+                  }}
                   className="px-3 py-2 rounded-xl border border-slate-200 text-xs font-bold text-slate-600 hover:bg-slate-50 cursor-pointer"
                 >
                   Cancel
@@ -1925,13 +2264,20 @@ export default function ReceptionDeskPage() {
       )}
       {showLogoutModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4 backdrop-blur-xs">
-          <div className="w-full max-w-sm rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="logout-confirmation-title"
+            className="w-full max-w-sm rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl"
+          >
             <div className="flex flex-col items-center text-center">
               <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-50 text-blue-600">
                 <LogOut className="h-5 w-5" />
               </div>
               <div className="mt-4">
-                <h3 className="text-base font-bold text-slate-900">Ready to leave the reception desk?</h3>
+                <h3 id="logout-confirmation-title" className="text-base font-bold text-slate-900">
+                  Ready to leave the reception desk?
+                </h3>
                 <p className="mt-2 text-xs leading-5 text-slate-500">
                   You can sign back in anytime to manage the patient queue.
                 </p>
@@ -1947,7 +2293,7 @@ export default function ReceptionDeskPage() {
               </button>
               <button
                 type="button"
-                onClick={confirmLogout}
+                onClick={() => void confirmLogout()}
                 className="cursor-pointer rounded-xl bg-blue-600 px-4 py-2.5 text-xs font-bold text-white shadow-md hover:bg-blue-700"
               >
                 Yes, Log Out
@@ -1956,7 +2302,6 @@ export default function ReceptionDeskPage() {
           </div>
         </div>
       )}
-
       {/* MODAL: Confirm patient reactivation */}
       {ticketToReactivate && (
         <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center z-50 p-4">
