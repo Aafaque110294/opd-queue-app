@@ -1,10 +1,12 @@
 'use client';
 
-import React, { useState, useEffect, useMemo, useCallback, Suspense } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef, Suspense } from 'react';
+import { createPortal } from 'react-dom';
 import { useSearchParams } from 'next/navigation';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
 import { patientSupabase } from '@/lib/supabase/patient-client';
-import { formatOpdSessions, getOpdSessions, OpdSession } from '@/lib/opd-schedule';
+import { formatCompactOpdSessions, formatOpdSessions, getOpdSessions, OpdSession } from '@/lib/opd-schedule';
+import { getClinicDateString, getClinicDateTimeParts, getClinicDayRange } from '@/lib/clinic-day';
 import { 
   Search, 
   Stethoscope, 
@@ -12,6 +14,7 @@ import {
   Clock, 
   IndianRupee, 
   Ticket, 
+  Bell,
   User, 
   Phone, 
   CheckCircle2, 
@@ -61,8 +64,6 @@ interface DoctorDirectoryRecord {
 interface QueueMetricTicket {
   doctor_id: string | null;
   status: string;
-  token_number: string | null;
-  patient_name: string | null;
 }
 
 interface DoctorRatingTicket {
@@ -97,8 +98,6 @@ interface DoctorDirectoryItem {
   department_id: string | null;
   department_name: string;
   waiting_count?: number;
-  current_token?: string | null;
-  current_patient_name?: string | null;
   opd_status?: string;
   broadcast_message?: string | null;
   rating: number;
@@ -106,6 +105,7 @@ interface DoctorDirectoryItem {
 
 interface ConfirmedTicket {
   id: string;
+  patient_user_id?: string | null;
   token_number: string;
   patient_name: string;
   phone: string;
@@ -139,27 +139,47 @@ function getErrorMessage(error: unknown, fallback: string): string {
 const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 const PATIENT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const PATIENT_ACTIVITY_STORAGE_KEY = 'opd-queue-patient-last-activity';
+const PATIENT_CALL_ALERTS_STORAGE_KEY = 'opd-queue-call-alerts-enabled';
 
-function getLocalDateString(date = new Date()): string {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
+function getPatientCallAlertsStorageKey(userId: string): string {
+  return `${PATIENT_CALL_ALERTS_STORAGE_KEY}:${userId}`;
+}
+
+function urlBase64ToUint8Array(value: string): ArrayBuffer {
+  const padding = '='.repeat((4 - (value.length % 4)) % 4);
+  const base64 = (value + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = window.atob(base64);
+  const output = new Uint8Array(rawData.length);
+  for (let index = 0; index < rawData.length; index += 1) {
+    output[index] = rawData.charCodeAt(index);
+  }
+  return output.buffer;
+}
+
+function pushSubscriptionMatchesVapidKey(subscription: PushSubscription, publicKey: string): boolean {
+  const subscribedKey = subscription.options.applicationServerKey;
+  if (!subscribedKey) return false;
+
+  const expectedKey = new Uint8Array(urlBase64ToUint8Array(publicKey));
+  const actualKey = new Uint8Array(subscribedKey);
+  return expectedKey.length === actualKey.length
+    && expectedKey.every((value, index) => value === actualKey[index]);
 }
 
 function getDoctorClosureReason(
   doctor: Pick<DoctorDirectoryItem, 'weekly_off_days' | 'opd_holiday_dates'>,
   date = new Date()
 ): string | null {
-  const dateString = getLocalDateString(date);
+  const dateString = getClinicDateString(date);
   if (doctor.opd_holiday_dates.includes(dateString)) return 'Holiday';
 
-  const weekday = WEEKDAY_NAMES[date.getDay()];
+  const weekday = WEEKDAY_NAMES[getClinicDateTimeParts(date).weekday];
   return doctor.weekly_off_days.includes(weekday) ? `${weekday} off` : null;
 }
 
 function isWithinOpdSession(session: OpdSession, date: Date): boolean {
-  const currentMinutes = date.getHours() * 60 + date.getMinutes();
+  const { hour, minute } = getClinicDateTimeParts(date);
+  const currentMinutes = hour * 60 + minute;
   const [startHour, startMinute] = session.start_time.split(':').map(Number);
   const [endHour, endMinute] = session.end_time.split(':').map(Number);
   const startMinutes = startHour * 60 + startMinute;
@@ -190,8 +210,17 @@ function DoctorBookingDirectoryContent() {
   const [loading, setLoading] = useState(true);
   const [directoryRefreshKey, setDirectoryRefreshKey] = useState(0);
   const [queueRefreshFailed, setQueueRefreshFailed] = useState(false);
+  const [scheduleUpdateToast, setScheduleUpdateToast] = useState('');
+  const scheduleSnapshotRef = useRef<Map<string, string> | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [currentTime, setCurrentTime] = useState(() => new Date());
+  const [scheduleTooltip, setScheduleTooltip] = useState<{
+    id: string;
+    text: string;
+    left: number;
+    top: number;
+    above: boolean;
+  } | null>(null);
   
   // Selected doctor for booking modal
   const [selectedDoctor, setSelectedDoctor] = useState<DoctorDirectoryItem | null>(null);
@@ -215,17 +244,30 @@ function DoctorBookingDirectoryContent() {
   const [authError, setAuthError] = useState('');
   const [authNotice, setAuthNotice] = useState('');
   const [showProfileMenu, setShowProfileMenu] = useState(false);
+  const profileMenuRef = useRef<HTMLDivElement>(null);
   const [showHistory, setShowHistory] = useState(false);
   const [historyTickets, setHistoryTickets] = useState<PatientHistoryTicket[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState('');
+  const [callAlertPreference, setCallAlertPreference] = useState<{ userId: string; enabled: boolean } | null>(null);
 
   const applyAuthenticatedUser = useCallback((user: SupabaseUser | null) => {
     setCurrentUser(user);
     if (!user) {
+      setCallAlertPreference(null);
       setActiveTab('DIRECTORY');
       setShowProfileMenu(false);
       return;
+    }
+
+    try {
+      setCallAlertPreference({
+        userId: user.id,
+        enabled: window.localStorage.getItem(getPatientCallAlertsStorageKey(user.id)) === 'true',
+      });
+    } catch (error) {
+      console.error('Failed to restore patient call alert preference:', error);
+      setCallAlertPreference({ userId: user.id, enabled: false });
     }
 
     const fullName = user.user_metadata?.full_name;
@@ -234,6 +276,70 @@ function DoctorBookingDirectoryContent() {
     if (typeof userPhone === 'string') setPhone(userPhone);
     setShowAuthModal(false);
   }, []);
+
+  useEffect(() => {
+    if (!showProfileMenu) return;
+
+    const closeProfileMenuOnOutsideClick = (event: PointerEvent) => {
+      if (event.target instanceof Node && !profileMenuRef.current?.contains(event.target)) {
+        setShowProfileMenu(false);
+      }
+    };
+
+    document.addEventListener('pointerdown', closeProfileMenuOnOutsideClick);
+    return () => document.removeEventListener('pointerdown', closeProfileMenuOnOutsideClick);
+  }, [showProfileMenu]);
+
+  useEffect(() => {
+    if (!scheduleTooltip) return;
+
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (
+        event.target instanceof Element
+        && !event.target.closest('[data-schedule-tooltip-trigger]')
+        && !event.target.closest('[data-schedule-tooltip]')
+      ) {
+        setScheduleTooltip(null);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setScheduleTooltip(null);
+    };
+    const closeOnViewportChange = () => setScheduleTooltip(null);
+
+    document.addEventListener('pointerdown', closeOnOutsideClick);
+    document.addEventListener('keydown', closeOnEscape);
+    window.addEventListener('resize', closeOnViewportChange);
+    window.addEventListener('scroll', closeOnViewportChange, true);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsideClick);
+      document.removeEventListener('keydown', closeOnEscape);
+      window.removeEventListener('resize', closeOnViewportChange);
+      window.removeEventListener('scroll', closeOnViewportChange, true);
+    };
+  }, [scheduleTooltip]);
+
+  const toggleScheduleTooltip = (
+    event: React.MouseEvent<HTMLButtonElement>,
+    id: string,
+    text: string
+  ) => {
+    if (scheduleTooltip?.id === id) {
+      setScheduleTooltip(null);
+      return;
+    }
+
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const width = Math.min(280, window.innerWidth - 24);
+    const above = bounds.bottom + 72 > window.innerHeight;
+    setScheduleTooltip({
+      id,
+      text,
+      left: Math.max(12 + width / 2, Math.min(bounds.left + bounds.width / 2, window.innerWidth - 12 - width / 2)),
+      top: above ? bounds.top - 8 : bounds.bottom + 8,
+      above,
+    });
+  };
 
   useEffect(() => {
     let isMounted = true;
@@ -441,6 +547,8 @@ function DoctorBookingDirectoryContent() {
       const { error } = await patientSupabase.auth.signOut({ scope: 'local' });
       if (error) throw error;
       applyAuthenticatedUser(null);
+      setConfirmedTicket(null);
+      setActiveTab('DIRECTORY');
       setShowHistory(false);
     } catch (err: unknown) {
       console.error('Patient sign-out failed:', err);
@@ -457,22 +565,46 @@ function DoctorBookingDirectoryContent() {
     setHistoryError('');
 
     try {
-      const userPhone = currentUser?.user_metadata?.phone;
-      if (typeof userPhone !== 'string' || userPhone.replace(/\D/g, '').length < 10) {
+      if (!currentUser) {
         setHistoryTickets([]);
-        setHistoryError('Your account does not have a registered mobile number for history lookup.');
+        setHistoryError('Sign in to view your booking history.');
         return;
       }
 
-      const { data, error } = await patientSupabase
+      const userPhone = currentUser.user_metadata?.phone;
+      const cleanUserPhone = typeof userPhone === 'string' ? userPhone.replace(/\D/g, '') : '';
+      const accountHistoryRequest = patientSupabase
         .from('tickets')
         .select('id, token_number, patient_name, status, created_at, doctor_id')
-        .eq('phone_number', userPhone.replace(/\D/g, ''))
+        .eq('patient_user_id', currentUser.id)
         .order('created_at', { ascending: false })
         .limit(25);
+      const phoneHistoryRequest = cleanUserPhone.length >= 10
+        ? patientSupabase
+          .from('tickets')
+          .select('id, token_number, patient_name, status, created_at, doctor_id')
+          .eq('phone_number', cleanUserPhone)
+          .order('created_at', { ascending: false })
+          .limit(25)
+        : null;
 
-      if (error) throw error;
-      setHistoryTickets((data || []) as PatientHistoryTicket[]);
+      const [accountHistory, phoneHistory] = await Promise.all([
+        accountHistoryRequest,
+        phoneHistoryRequest,
+      ]);
+      if (accountHistory.error) throw accountHistory.error;
+      if (phoneHistory?.error) throw phoneHistory.error;
+
+      const ticketsById = new Map<string, PatientHistoryTicket>();
+      for (const ticket of [...(accountHistory.data || []), ...(phoneHistory?.data || [])]) {
+        ticketsById.set(ticket.id, ticket as PatientHistoryTicket);
+      }
+
+      setHistoryTickets(
+        [...ticketsById.values()]
+          .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())
+          .slice(0, 25)
+      );
     } catch (error: unknown) {
       console.error('Patient history lookup failed:', error);
       setHistoryError(getErrorMessage(error, 'Could not load your booking history.'));
@@ -485,6 +617,16 @@ function DoctorBookingDirectoryContent() {
   const [confirmedTicket, setConfirmedTicket] = useState<ConfirmedTicket | null>(null);
   const [trackedDoctor, setTrackedDoctor] = useState<TrackedDoctorStatus | null>(null);
   const [cancelLoading, setCancelLoading] = useState(false);
+  const [callAlertMessage, setCallAlertMessage] = useState('');
+  const [callAlertLoading, setCallAlertLoading] = useState(false);
+  const callAlertStatusRequestRef = useRef(0);
+  const callAlertTicketId = confirmedTicket?.id;
+  const callAlertTicketStatus = confirmedTicket?.status;
+  const callAlertsEnabled = Boolean(
+    currentUser
+    && callAlertPreference?.userId === currentUser.id
+    && callAlertPreference.enabled
+  );
 
   // Live queue tracking counters
   const [nowServingToken, setNowServingToken] = useState<string | null>(null);
@@ -498,10 +640,236 @@ function DoctorBookingDirectoryContent() {
   const [ratingSaving, setRatingSaving] = useState(false);
   const [ratingMessage, setRatingMessage] = useState('');
 
+  const enableCallAlerts = async () => {
+    callAlertStatusRequestRef.current += 1;
+    setCallAlertMessage('');
+    setCallAlertLoading(true);
+
+    try {
+      if (!currentUser) throw new Error('Sign in to enable call alerts.');
+
+      const vapidPublicKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
+      const supportsPush = 'serviceWorker' in navigator
+        && 'PushManager' in window
+        && 'Notification' in window;
+
+      if (!vapidPublicKey) {
+        setCallAlertMessage('Background notifications need server push configuration.');
+        return;
+      }
+
+      if (!supportsPush) {
+        setCallAlertMessage('This browser does not support background notifications.');
+        return;
+      }
+
+      const permission = Notification.permission === 'granted'
+        ? 'granted'
+        : await Notification.requestPermission();
+      if (permission !== 'granted') {
+        setCallAlertMessage('Allow notifications in your browser to receive call alerts.');
+        return;
+      }
+
+      const { data: { session }, error: sessionError } = await patientSupabase.auth.getSession();
+      if (sessionError) throw sessionError;
+      if (!session?.access_token) {
+        setCallAlertMessage('Sign in again to enable background notifications.');
+        return;
+      }
+
+      const registration = await navigator.serviceWorker.register('/sw.js');
+      const pushManager = registration.pushManager;
+      let existingSubscription = await pushManager.getSubscription();
+      if (existingSubscription && !pushSubscriptionMatchesVapidKey(existingSubscription, vapidPublicKey)) {
+        const removeResponse = await fetch('/api/push/subscriptions', {
+          method: 'DELETE',
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            endpoint: existingSubscription.endpoint,
+          }),
+        });
+        const removeResult = await removeResponse.json() as { error?: string };
+        if (!removeResponse.ok) {
+          throw new Error(removeResult.error || 'Unable to replace the outdated browser alert subscription.');
+        }
+
+        const unsubscribed = await existingSubscription.unsubscribe();
+        if (!unsubscribed) throw new Error('Unable to replace the outdated browser alert subscription.');
+        existingSubscription = null;
+      }
+
+      if (!existingSubscription) {
+        await pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(vapidPublicKey),
+        });
+      }
+
+      const activeSubscription = await pushManager.getSubscription();
+      if (!activeSubscription) throw new Error('Unable to create a browser push subscription.');
+      const response = await fetch('/api/push/subscriptions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${session.access_token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ subscription: activeSubscription.toJSON() }),
+      });
+      const result = await response.json() as { attached?: number; error?: string };
+      if (!response.ok) throw new Error(result.error || 'Unable to enable background alerts.');
+
+      window.localStorage.setItem(getPatientCallAlertsStorageKey(currentUser.id), 'true');
+      setCallAlertPreference({ userId: currentUser.id, enabled: true });
+      setCallAlertMessage(result.attached
+        ? `Call alerts are enabled for ${result.attached} active ticket(s) on this device.`
+        : 'Call alerts are saved for your account and will apply to its active tickets on this device.');
+    } catch (error: unknown) {
+      console.error('Enabling patient call alerts failed:', error);
+      setCallAlertMessage(getErrorMessage(error, 'Could not enable call alerts.'));
+    } finally {
+      setCallAlertLoading(false);
+    }
+  };
+
+  const disableCallAlerts = async () => {
+    callAlertStatusRequestRef.current += 1;
+    setCallAlertMessage('');
+    setCallAlertLoading(true);
+
+    try {
+      if (!currentUser) throw new Error('Sign in to update call alerts.');
+
+      const registration = await navigator.serviceWorker.getRegistration();
+      const subscription = await registration?.pushManager.getSubscription();
+      if (subscription) {
+        const { data: { session }, error: sessionError } = await patientSupabase.auth.getSession();
+        if (sessionError) throw sessionError;
+        if (!session?.access_token) {
+          setCallAlertMessage('Sign in again to disable call alerts.');
+          return;
+        }
+
+        const response = await fetch('/api/push/subscriptions', {
+          method: 'DELETE',
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ endpoint: subscription.endpoint }),
+        });
+        const result = await response.json() as { error?: string };
+        if (!response.ok) throw new Error(result.error || 'Unable to disable call alerts.');
+
+        const unsubscribed = await subscription.unsubscribe();
+        if (!unsubscribed) throw new Error('Unable to disable browser call alerts.');
+      }
+
+      window.localStorage.removeItem(getPatientCallAlertsStorageKey(currentUser.id));
+      setCallAlertPreference({ userId: currentUser.id, enabled: false });
+      setCallAlertMessage('Call alerts are disabled on this device. You can turn them on again at any time.');
+    } catch (error: unknown) {
+      console.error('Disabling patient call alerts failed:', error);
+      setCallAlertMessage(getErrorMessage(error, 'Could not disable call alerts.'));
+    } finally {
+      setCallAlertLoading(false);
+    }
+  };
+
   useEffect(() => {
-    const clock = window.setInterval(() => setCurrentTime(new Date()), 30_000);
-    return () => window.clearInterval(clock);
+    let isCurrent = true;
+    const requestId = ++callAlertStatusRequestRef.current;
+    const activeTicket = callAlertTicketId
+      && ['waiting', 'in-consultation'].includes(callAlertTicketStatus || '')
+      && confirmedTicket?.patient_user_id === currentUser?.id;
+
+    if (!activeTicket || !currentUser || !callAlertsEnabled) {
+      return () => {
+        isCurrent = false;
+      };
+    }
+
+    const attachCallAlertsToActiveTicket = async () => {
+      try {
+        if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+        const registration = await navigator.serviceWorker.getRegistration();
+        const subscription = await registration?.pushManager.getSubscription();
+        if (!subscription) {
+          if (isCurrent) {
+            setCallAlertMessage('Call alert preference is on, but this browser has no push subscription. Turn alerts off and on to restore it.');
+          }
+          return;
+        }
+
+        const { data: { session }, error: sessionError } = await patientSupabase.auth.getSession();
+        if (sessionError) throw sessionError;
+        if (!session?.access_token) throw new Error('Sign in again to attach call alerts to this token.');
+
+        const response = await fetch('/api/push/subscriptions', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            ticketId: callAlertTicketId,
+            subscription: subscription.toJSON(),
+          }),
+        });
+        const result = await response.json() as { error?: string };
+        if (!response.ok) throw new Error(result.error || 'Unable to check call alert settings.');
+        if (isCurrent && callAlertStatusRequestRef.current === requestId) {
+          setCallAlertMessage('Call alerts are enabled for this active token on this device.');
+        }
+      } catch (error: unknown) {
+        console.error('Attaching patient call alerts to active ticket failed:', error);
+        if (isCurrent && callAlertStatusRequestRef.current === requestId) {
+          setCallAlertMessage(getErrorMessage(error, 'Could not attach call alerts to this token.'));
+        }
+      }
+    };
+
+    void attachCallAlertsToActiveTicket();
+    return () => {
+      isCurrent = false;
+    };
+  }, [callAlertTicketId, callAlertTicketStatus, callAlertsEnabled, confirmedTicket?.patient_user_id, currentUser]);
+
+  useEffect(() => {
+    let clockTimeout: number;
+
+    const refreshClock = () => {
+      setCurrentTime(new Date());
+      clockTimeout = window.setTimeout(
+        refreshClock,
+        60_000 - (Date.now() % 60_000) + 10
+      );
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') return;
+      window.clearTimeout(clockTimeout);
+      refreshClock();
+    };
+
+    refreshClock();
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      window.clearTimeout(clockTimeout);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
   }, []);
+
+  useEffect(() => {
+    if (!scheduleUpdateToast) return;
+
+    const timeout = window.setTimeout(() => setScheduleUpdateToast(''), 4000);
+    return () => window.clearTimeout(timeout);
+  }, [scheduleUpdateToast]);
 
   // 1. Fetch all doctors and their live queue metrics for today
   useEffect(() => {
@@ -510,7 +878,7 @@ function DoctorBookingDirectoryContent() {
     async function loadDirectory() {
       try {
         if (directoryRefreshKey === 0) setLoading(true);
-        const today = new Date().toISOString().split('T')[0];
+        const { start, end } = getClinicDayRange();
 
         // Safe parallel queries using allSettled so one table never breaks the others
         const [docRes, clinicsRes, deptsRes, ticketsRes, ratingsRes] = await Promise.allSettled([
@@ -519,8 +887,9 @@ function DoctorBookingDirectoryContent() {
           patientSupabase.from('departments').select('id, name'),
           patientSupabase
             .from('tickets')
-            .select('id, doctor_id, status, token_number, patient_name')
-            .gte('created_at', `${today}T00:00:00.000Z`)
+            .select('id, doctor_id, status')
+            .gte('created_at', start)
+            .lt('created_at', end)
           ,
           patientSupabase
             .from('tickets')
@@ -560,7 +929,6 @@ function DoctorBookingDirectoryContent() {
 
           const docTickets = todayTickets.filter(ticket => ticket.doctor_id === doc.id);
           const waitingCount = docTickets.filter(ticket => ticket.status === 'waiting').length;
-          const activeConsultation = docTickets.find(ticket => ticket.status === 'in-consultation');
           const rating = ratingMap.get(doc.id);
 
           return {
@@ -578,13 +946,34 @@ function DoctorBookingDirectoryContent() {
             department_id: doc.department_id || null,
             department_name: deptName || 'General OPD',
             waiting_count: waitingCount,
-            current_token: activeConsultation?.token_number || null,
-            current_patient_name: activeConsultation?.patient_name || null,
             opd_status: doc.opd_status || 'ACTIVE',
             broadcast_message: doc.broadcast_message || null,
             rating: rating ? rating.total / rating.count : 3,
           };
         });
+
+        const nextScheduleSnapshot = new Map(
+          formatted.map((doctor) => [
+            doctor.id,
+            JSON.stringify([
+              doctor.opd_shift,
+              doctor.opd_timing,
+              doctor.opd_sessions,
+              doctor.weekly_off_days,
+              doctor.opd_holiday_dates,
+            ]),
+          ])
+        );
+        const previousScheduleSnapshot = scheduleSnapshotRef.current;
+        const scheduleChanged = previousScheduleSnapshot
+          && formatted.some((doctor) => {
+            const previousSchedule = previousScheduleSnapshot.get(doctor.id);
+            return previousSchedule !== undefined
+              && previousSchedule !== nextScheduleSnapshot.get(doctor.id);
+          });
+
+        scheduleSnapshotRef.current = nextScheduleSnapshot;
+        if (scheduleChanged) setScheduleUpdateToast('OPD schedule updated successfully.');
 
         setDoctors(formatted);
 
@@ -618,46 +1007,57 @@ function DoctorBookingDirectoryContent() {
       isRefreshingMetrics = true;
 
       try {
-        const today = new Date().toISOString().split('T')[0];
-        const { data, error } = await patientSupabase
-          .from('tickets')
-          .select('doctor_id, status, token_number, patient_name')
-          .gte('created_at', `${today}T00:00:00.000Z`);
+        const { start, end } = getClinicDayRange();
+        const [ticketsResult, ratingsResult] = await Promise.all([
+          patientSupabase
+            .from('tickets')
+            .select('doctor_id, status')
+            .gte('created_at', start)
+            .lt('created_at', end),
+          patientSupabase
+            .from('tickets')
+            .select('doctor_id, rating')
+            .eq('status', 'completed')
+            .not('rating', 'is', null),
+        ]);
 
-        if (error) throw error;
+        if (ticketsResult.error) throw ticketsResult.error;
+        if (ratingsResult.error) throw ratingsResult.error;
         if (!isActive) return;
         setQueueRefreshFailed(false);
 
-        const tickets = (data || []) as QueueMetricTicket[];
+        const tickets = (ticketsResult.data || []) as QueueMetricTicket[];
+        const ratingTickets = (ratingsResult.data || []) as DoctorRatingTicket[];
         const metricsByDoctor = new Map<string, {
           waitingCount: number;
-          currentToken: string | null;
-          currentPatientName: string | null;
         }>();
+        const ratingByDoctor = new Map<string, { total: number; count: number }>();
 
         tickets.forEach((ticket) => {
           if (!ticket.doctor_id) return;
           const metrics = metricsByDoctor.get(ticket.doctor_id) || {
             waitingCount: 0,
-            currentToken: null,
-            currentPatientName: null,
           };
 
           if (ticket.status === 'waiting') metrics.waitingCount += 1;
-          if (ticket.status === 'in-consultation') {
-            metrics.currentToken = ticket.token_number;
-            metrics.currentPatientName = ticket.patient_name;
-          }
           metricsByDoctor.set(ticket.doctor_id, metrics);
+        });
+
+        ratingTickets.forEach((ticket) => {
+          if (!ticket.doctor_id || ticket.rating == null) return;
+          const rating = ratingByDoctor.get(ticket.doctor_id) || { total: 0, count: 0 };
+          rating.total += ticket.rating;
+          rating.count += 1;
+          ratingByDoctor.set(ticket.doctor_id, rating);
         });
 
         setDoctors((currentDoctors) => currentDoctors.map((doctor) => {
           const metrics = metricsByDoctor.get(doctor.id);
+          const rating = ratingByDoctor.get(doctor.id);
           return {
             ...doctor,
             waiting_count: metrics?.waitingCount || 0,
-            current_token: metrics?.currentToken || null,
-            current_patient_name: metrics?.currentPatientName || null,
+            rating: rating ? rating.total / rating.count : 3,
           };
         }));
       } catch (error: unknown) {
@@ -771,7 +1171,7 @@ function DoctorBookingDirectoryContent() {
 
     async function syncLiveQueuePosition() {
       try {
-        const today = new Date().toISOString().split('T')[0];
+        const { start, end } = getClinicDayRange();
 
         const { data: currentT } = await patientSupabase
           .from('tickets')
@@ -780,14 +1180,27 @@ function DoctorBookingDirectoryContent() {
           .single();
 
         if (currentT) {
-          setConfirmedTicket(prev => prev ? { ...prev, status: currentT.status, rating: currentT.rating } : null);
+          const currentTicketDate = new Date(currentT.created_at);
+          const ticketIsOutsideToday = currentTicketDate < new Date(start) || currentTicketDate >= new Date(end);
+          const displayStatus = ticketIsOutsideToday && ['waiting', 'skipped'].includes(currentT.status)
+            ? 'expired'
+            : currentT.status;
+
+          setConfirmedTicket(prev => prev ? { ...prev, status: displayStatus, rating: currentT.rating } : null);
+
+          if (displayStatus === 'expired') {
+            setNowServingToken(null);
+            setPatientsAhead(0);
+            return;
+          }
 
           const { data: inCabin } = await patientSupabase
             .from('tickets')
             .select('token_number')
             .eq('doctor_id', currentT.doctor_id)
             .eq('status', 'in-consultation')
-            .gte('created_at', `${today}T00:00:00.000Z`)
+            .gte('created_at', start)
+            .lt('created_at', end)
             .maybeSingle();
 
           setNowServingToken(inCabin?.token_number || 'None');
@@ -797,7 +1210,8 @@ function DoctorBookingDirectoryContent() {
             .select('*', { count: 'exact', head: true })
             .eq('doctor_id', currentT.doctor_id)
             .eq('status', 'waiting')
-            .gte('created_at', `${today}T00:00:00.000Z`)
+            .gte('created_at', start)
+            .lt('created_at', end)
             .lt('created_at', currentT.created_at);
 
           setPatientsAhead(count || 0);
@@ -883,14 +1297,15 @@ function DoctorBookingDirectoryContent() {
         throw new Error(`Bookings are unavailable for this doctor today (${closureReason}).`);
       }
 
-      const today = new Date().toISOString().split('T')[0];
+      const { start, end } = getClinicDayRange();
 
       const { data: existingTicket } = await patientSupabase
         .from('tickets')
         .select('id, token_number, status')
         .eq('doctor_id', selectedDoctor.id)
         .eq('phone_number', cleanPhone)
-        .gte('created_at', `${today}T00:00:00.000Z`)
+        .gte('created_at', start)
+        .lt('created_at', end)
         .in('status', ['waiting', 'in-consultation'])
         .maybeSingle();
 
@@ -905,6 +1320,7 @@ function DoctorBookingDirectoryContent() {
             clinic_id: selectedDoctor.clinic_id || null,
             doctor_id: selectedDoctor.id,
             department_id: selectedDoctor.department_id,
+            patient_user_id: currentUser.id,
             token_number: 'T',
             patient_name: patientName.trim(),
             phone_number: cleanPhone,
@@ -922,6 +1338,7 @@ function DoctorBookingDirectoryContent() {
 
       setConfirmedTicket({
         id: ticketData.id,
+        patient_user_id: currentUser.id,
         token_number: ticketData.token_number,
         patient_name: ticketData.patient_name,
         phone: ticketData.phone_number || cleanPhone,
@@ -954,12 +1371,13 @@ function DoctorBookingDirectoryContent() {
         throw new Error('Please enter a valid 10-digit mobile number.');
       }
 
-      const today = new Date().toISOString().split('T')[0];
+      const { start, end } = getClinicDayRange();
 
       const { data: ticket, error: ticketErr } = await patientSupabase
         .from('tickets')
         .select(`
           id,
+          patient_user_id,
           doctor_id,
           token_number,
           patient_name,
@@ -974,8 +1392,9 @@ function DoctorBookingDirectoryContent() {
           )
         `)
         .eq('phone_number', cleanPhone)
-        .gte('created_at', `${today}T00:00:00.000Z`)
-        .in('status', ['waiting', 'in-consultation', 'completed', 'skipped'])
+        .gte('created_at', start)
+        .lt('created_at', end)
+        .in('status', ['waiting', 'in-consultation', 'completed', 'skipped', 'expired'])
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle();
@@ -989,6 +1408,7 @@ function DoctorBookingDirectoryContent() {
 
       setConfirmedTicket({
         id: ticket.id,
+        patient_user_id: ticket.patient_user_id,
         token_number: ticket.token_number,
         patient_name: ticket.patient_name,
         phone: ticket.phone_number,
@@ -1064,13 +1484,31 @@ function DoctorBookingDirectoryContent() {
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 pb-16">
-      
+      {scheduleUpdateToast && (
+        <div
+          className="fixed right-4 top-4 z-50 flex max-w-sm items-center gap-2 rounded-xl border border-emerald-200 bg-white px-4 py-3 text-sm font-semibold text-emerald-800 shadow-lg"
+          role="status"
+          aria-live="polite"
+        >
+          <CheckCircle2 className="h-5 w-5 shrink-0 text-emerald-600" />
+          <span className="flex-1">{scheduleUpdateToast}</span>
+          <button
+            type="button"
+            onClick={() => setScheduleUpdateToast('')}
+            aria-label="Dismiss schedule update notification"
+            className="text-emerald-600 hover:text-emerald-800"
+          >
+            <XCircle className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+
       {/* Header Banner */}
       <header className="bg-slate-950 text-white border-b border-slate-800">
-        <div className="max-w-5xl mx-auto px-4 sm:px-6 py-8">
-          <div className="flex flex-col gap-5">
-            <div className="flex min-w-0 items-center justify-between gap-2 sm:gap-4">
-            <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
+        <div className="max-w-5xl mx-auto px-4 sm:px-6 py-5 sm:py-8">
+          <div className="flex flex-col gap-4 sm:gap-5">
+            <div className="flex w-full flex-wrap items-center justify-between gap-3 sm:flex-nowrap sm:gap-4">
+            <div className="flex w-full min-w-0 items-center gap-2.5 sm:w-auto sm:gap-3">
               <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-blue-600 text-white shadow-lg shadow-blue-500/25 sm:h-11 sm:w-11">
                 <Stethoscope className="w-6 h-6" />
               </div>
@@ -1080,41 +1518,40 @@ function DoctorBookingDirectoryContent() {
               </div>
             </div>
 
-            <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
+            <div className="ml-auto flex shrink-0 items-center gap-2 sm:gap-2">
               <button
                 type="button"
                 onClick={() => {
                   setActiveTab('DIRECTORY');
                   setConfirmedTicket(null);
                 }}
-                className="rounded-xl bg-blue-600 px-2.5 py-2 text-[10px] font-bold text-white shadow-lg shadow-blue-900/20 transition-all hover:bg-blue-500 hover:shadow-blue-900/30 cursor-pointer sm:px-4 sm:py-2.5 sm:text-xs"
+                className="whitespace-nowrap rounded-xl bg-blue-600 px-3 py-2 text-xs font-bold text-white shadow-lg shadow-blue-900/20 transition-all hover:bg-blue-500 hover:shadow-blue-900/30 cursor-pointer sm:px-4 sm:py-2.5"
               >
-                <span className="sm:hidden">Book</span>
-                <span className="hidden sm:inline">Book New Token</span>
+                Book New Token
               </button>
 
               {currentUser && (
-                <div className="relative">
+                <div ref={profileMenuRef} className="relative">
                   <button
                     type="button"
                     aria-expanded={showProfileMenu}
                     onClick={() => setShowProfileMenu((open) => !open)}
-                    className="group flex items-center gap-2 rounded-2xl border border-slate-700 bg-slate-900 px-2.5 py-2 text-left shadow-lg shadow-black/10 transition-all hover:border-blue-400 hover:bg-slate-800 cursor-pointer"
+                    className="group flex min-w-0 max-w-40 items-center gap-1.5 rounded-2xl border border-slate-700 bg-slate-900 px-2 py-1.5 text-left shadow-lg shadow-black/10 transition-all hover:border-blue-400 hover:bg-slate-800 cursor-pointer sm:max-w-56 sm:gap-2 sm:px-2.5 sm:py-2"
                   >
-                    <span className="flex h-8 w-8 items-center justify-center rounded-xl bg-gradient-to-br from-blue-400 to-indigo-500 text-xs font-black text-white shadow-inner">
+                    <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-blue-400 to-indigo-500 text-[10px] font-black text-white shadow-inner sm:h-8 sm:w-8 sm:rounded-xl sm:text-xs">
                       {(String(currentUser.user_metadata?.full_name || currentUser.email || 'P').trim().charAt(0) || 'P').toUpperCase()}
                     </span>
-                    <span className="hidden max-w-28 truncate text-xs font-bold text-white sm:block">
+                    <span className="min-w-0 max-w-28 truncate text-[10px] font-bold text-white sm:text-xs">
                       {String(currentUser.user_metadata?.full_name || currentUser.email || 'Patient')}
                     </span>
-                    <ChevronDown className={`h-3.5 w-3.5 text-slate-400 transition-transform group-hover:text-white ${showProfileMenu ? 'rotate-180' : ''}`} />
+                    <ChevronDown className={`h-3 w-3 shrink-0 text-slate-400 transition-transform group-hover:text-white sm:h-3.5 sm:w-3.5 ${showProfileMenu ? 'rotate-180' : ''}`} />
                   </button>
 
                   {showProfileMenu && (
                     <div className="absolute right-0 top-[calc(100%+0.75rem)] z-40 w-64 overflow-hidden rounded-3xl border border-slate-200 bg-white text-slate-900 shadow-2xl shadow-slate-950/20">
                       <div className="border-b border-slate-800 bg-slate-950 px-4 py-4 text-white">
                         <div className="flex items-center gap-3">
-                          <span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-slate-800 text-base font-black text-white ring-1 ring-slate-700">
+                          <span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-blue-600 text-base font-black text-white ring-1 ring-blue-400">
                             {(String(currentUser.user_metadata?.full_name || currentUser.email || 'P').trim().charAt(0) || 'P').toUpperCase()}
                           </span>
                           <div className="min-w-0">
@@ -1125,20 +1562,6 @@ function DoctorBookingDirectoryContent() {
                         <p className="mt-3 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-400">Patient account</p>
                       </div>
                       <div className="space-y-1 p-2">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setActiveTab('DIRECTORY');
-                          setConfirmedTicket(null);
-                          setShowProfileMenu(false);
-                        }}
-                        className="flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left text-xs font-bold text-slate-600 transition-colors hover:bg-blue-50 hover:text-blue-700 cursor-pointer"
-                      >
-                        <span className="flex h-8 w-8 items-center justify-center rounded-xl bg-slate-100 text-slate-500">
-                          <Stethoscope className="h-4 w-4" />
-                        </span>
-                        <span>Book New Token</span>
-                      </button>
                       <button
                         type="button"
                         onClick={() => {
@@ -1163,6 +1586,44 @@ function DoctorBookingDirectoryContent() {
                         </span>
                         <span>Booking History</span>
                       </button>
+                      <div className="my-1 border-t border-slate-100" />
+                      <div className="flex items-center justify-between gap-3 rounded-2xl px-3 py-3">
+                        <span className="flex min-w-0 items-center gap-3">
+                          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-amber-50 text-amber-600">
+                            <Bell className="h-4 w-4" />
+                          </span>
+                          <span className="min-w-0">
+                            <span className="block text-xs font-bold text-slate-700">Call alerts</span>
+                            <span className="block text-[10px] leading-4 text-slate-400">
+                              {callAlertsEnabled
+                                ? 'Saved for your account on this device'
+                                : 'For this account, until you turn it off'}
+                            </span>
+                          </span>
+                        </span>
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-label="Call alerts"
+                          aria-checked={callAlertsEnabled}
+                          disabled={callAlertLoading || !currentUser || callAlertPreference?.userId !== currentUser.id}
+                          onClick={() => void (callAlertsEnabled ? disableCallAlerts() : enableCallAlerts())}
+                          className={`relative h-6 w-11 shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                            callAlertsEnabled ? 'bg-blue-600' : 'bg-slate-300'
+                          }`}
+                        >
+                          <span
+                            className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${
+                              callAlertsEnabled ? 'left-[22px]' : 'left-0.5'
+                            }`}
+                          />
+                        </button>
+                      </div>
+                      {callAlertMessage && (
+                        <p className="px-3 pb-2 text-[10px] font-medium leading-4 text-slate-500" role="status">
+                          {callAlertMessage}
+                        </p>
+                      )}
                       <div className="my-1 border-t border-slate-100" />
                       <button
                         type="button"
@@ -1225,7 +1686,9 @@ function DoctorBookingDirectoryContent() {
             
             {/* Dynamic Status Header */}
             <div className={`p-6 text-white text-center transition-all ${
-              confirmedTicket.status === 'skipped'
+              confirmedTicket.status === 'expired'
+                ? 'bg-slate-600'
+                : confirmedTicket.status === 'skipped'
                 ? 'bg-amber-600'
                 : confirmedTicket.status === 'completed'
                 ? 'bg-emerald-600'
@@ -1237,7 +1700,9 @@ function DoctorBookingDirectoryContent() {
             }`}>
               <CheckCircle2 className="w-12 h-12 mx-auto mb-2 text-white/90" />
               <h2 className="text-xl font-black tracking-tight">
-                {confirmedTicket.status === 'skipped'
+                {confirmedTicket.status === 'expired'
+                  ? 'Token Expired'
+                  : confirmedTicket.status === 'skipped'
                   ? 'Token Skipped'
                   : confirmedTicket.status === 'completed'
                   ? 'Consultation Completed'
@@ -1248,7 +1713,9 @@ function DoctorBookingDirectoryContent() {
                   : 'Token Confirmed & Queued'}
               </h2>
               <p className="text-xs text-white/80 mt-0.5">
-                {confirmedTicket.status === 'skipped'
+                {confirmedTicket.status === 'expired'
+                  ? 'This token was not served on its booking day. Please book a new token if you still need a consultation.'
+                  : confirmedTicket.status === 'skipped'
                   ? 'Please visit the reception counter to reactivate your token.'
                   : confirmedTicket.status === 'completed'
                   ? 'Thank you for visiting! Wishing you a speedy recovery.'
@@ -1277,7 +1744,16 @@ function DoctorBookingDirectoryContent() {
               </div>
 
               {/* LIVE QUEUE OR COMPLETED SUMMARY */}
-              {confirmedTicket.status === 'skipped' ? (
+              {confirmedTicket.status === 'expired' ? (
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-center">
+                  <div className="text-xs font-bold uppercase tracking-wide text-slate-700">
+                    Token Not Served
+                  </div>
+                  <p className="mt-2 text-xs leading-relaxed text-slate-600">
+                    Tokens are valid only for the day they are issued. Please book a new token for another visit.
+                  </p>
+                </div>
+              ) : confirmedTicket.status === 'skipped' ? (
                 <div className="p-4 rounded-2xl bg-amber-50 border border-amber-200 text-center space-y-2">
                   <div className="text-xs font-bold text-amber-800 uppercase tracking-wide">
                     Token Not Active
@@ -1409,7 +1885,9 @@ function DoctorBookingDirectoryContent() {
                 <div className="flex justify-between items-center">
                   <span className="text-slate-400 font-medium">Status:</span>
                   <span className={`font-black uppercase text-xs ${
-                    confirmedTicket.status === 'skipped'
+                    confirmedTicket.status === 'expired'
+                      ? 'text-slate-600'
+                      : confirmedTicket.status === 'skipped'
                       ? 'text-amber-600'
                       : confirmedTicket.status === 'completed'
                       ? 'text-emerald-600'
@@ -1417,7 +1895,9 @@ function DoctorBookingDirectoryContent() {
                       ? 'text-blue-600'
                       : 'text-amber-600'
                   }`}>
-                    {confirmedTicket.status === 'skipped'
+                    {confirmedTicket.status === 'expired'
+                      ? 'Token Expired'
+                      : confirmedTicket.status === 'skipped'
                       ? '⚠️ Token Skipped'
                       : confirmedTicket.status === 'completed'
                       ? '✅ Completed'
@@ -1428,15 +1908,19 @@ function DoctorBookingDirectoryContent() {
                 </div>
               </div>
 
+              <p className="rounded-xl border border-blue-100 bg-blue-50 px-4 py-3 text-center text-xs font-medium leading-relaxed text-blue-800">
+                Doctor consultation fees, if applicable, are payable directly at the clinic/hospital.
+              </p>
+
               {/* Action Buttons */}
-              <div className="space-y-2.5">
+              <div className={confirmedTicket.status === 'waiting' ? 'grid grid-cols-2 gap-2.5' : 'space-y-2.5'}>
                 <button
                   type="button"
                   onClick={() => window.print()}
-                  className="w-full py-3 rounded-xl bg-slate-900 hover:bg-black text-white text-xs font-bold transition-colors cursor-pointer flex items-center justify-center gap-2"
+                  className="w-full px-2 py-3 rounded-xl bg-slate-900 hover:bg-black text-white text-xs font-bold transition-colors cursor-pointer flex items-center justify-center gap-2"
                 >
                   <Printer className="w-4 h-4" />
-                  <span>Print / Save Visit Slip</span>
+                  <span>Print / Save Slip</span>
                 </button>
 
                 {confirmedTicket.status === 'waiting' && (
@@ -1444,7 +1928,7 @@ function DoctorBookingDirectoryContent() {
                     type="button"
                     disabled={cancelLoading}
                     onClick={handleCancelBooking}
-                    className="w-full py-2.5 rounded-xl border border-rose-200 hover:bg-rose-50 text-rose-600 text-xs font-bold transition-colors flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+                    className="w-full px-2 py-3 rounded-xl border border-rose-200 text-rose-600 hover:bg-rose-50 text-[10px] font-bold transition-colors flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer disabled:opacity-50"
                   >
                     <XCircle className="w-4 h-4" />
                     <span>{cancelLoading ? 'Cancelling Token...' : 'Cancel My Booking'}</span>
@@ -1454,7 +1938,9 @@ function DoctorBookingDirectoryContent() {
                 <button
                   type="button"
                   onClick={() => setConfirmedTicket(null)}
-                  className={`w-full py-2.5 text-xs font-bold rounded-xl transition-colors cursor-pointer ${
+                  className={`w-full py-2.5 text-center text-xs font-bold rounded-xl transition-colors cursor-pointer ${
+                    confirmedTicket.status === 'waiting' ? 'col-span-2 justify-self-center' : ''
+                  } ${
                     confirmedTicket.status === 'completed'
                       ? 'bg-blue-50 text-blue-700 hover:bg-blue-100'
                       : 'text-slate-400 hover:text-slate-600'
@@ -1480,6 +1966,10 @@ function DoctorBookingDirectoryContent() {
                 Enter the mobile number you used while booking to check your live queue status.
               </p>
             </div>
+
+            <p className="mb-4 rounded-xl border border-blue-100 bg-blue-50 px-4 py-3 text-center text-xs font-medium leading-relaxed text-blue-800">
+              Doctor consultation fees, if applicable, are payable directly at the clinic/hospital.
+            </p>
 
             {trackerError && (
               <div className="mb-4 p-3 rounded-2xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-semibold flex items-start gap-2">
@@ -1533,7 +2023,7 @@ function DoctorBookingDirectoryContent() {
 
             {queueRefreshFailed && (
               <p className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800" role="status">
-                Live queue data could not be refreshed. Retrying automatically.
+                Live doctor card data could not be refreshed. Retrying automatically.
               </p>
             )}
 
@@ -1572,39 +2062,40 @@ function DoctorBookingDirectoryContent() {
                       </div>
 
                       {/* Doctor & Clinic */}
-                      <div className="grid min-h-12 grid-cols-[minmax(0,1fr)_minmax(7rem,42%)] items-center gap-3">
-                        <div className="flex min-w-0 items-center gap-2.5">
-                          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-600 to-indigo-600 text-white shadow-sm">
-                            <Stethoscope className="h-5 w-5" />
+                      <div className="flex min-h-12 items-center justify-between gap-2">
+                        <div className="flex min-w-0 flex-1 items-center gap-2.5">
+                          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-600 to-indigo-600 text-white shadow-sm">
+                            <Stethoscope className="h-6 w-6" />
                           </div>
-                          <h3
-                            className="min-w-0 text-base font-black leading-5 tracking-tight text-slate-900"
-                            title={doc.name}
-                          >
-                            <span className="line-clamp-2">{doc.name}</span>
-                          </h3>
-                        </div>
-                        <div className="flex min-w-0 flex-col items-end gap-1 text-right text-xs font-medium leading-4 text-slate-600">
-                          <div className="flex min-w-0 items-center justify-end gap-1.5">
-                            <span className="min-w-0 truncate" title={`${doc.clinic_name} · ${doc.room_number}`}>
-                              {doc.clinic_name} · {doc.room_number}
-                            </span>
-                            <Building2 className="h-3.5 w-3.5 shrink-0 text-blue-500" />
+                          <div className="min-w-0 flex-1">
+                            <h3
+                              className="text-base font-black leading-5 tracking-tight text-slate-900"
+                              title={doc.name}
+                            >
+                              <span className="line-clamp-2">{doc.name}</span>
+                            </h3>
+                            <div
+                              className="mt-0.5 flex min-w-0 items-center gap-1 text-[11px] font-medium leading-4 text-slate-600"
+                              title={`${doc.clinic_name} · ${doc.room_number}`}
+                            >
+                              <Building2 className="h-3 w-3 shrink-0 text-blue-500" />
+                              <span className="min-w-0 truncate">{doc.clinic_name} · {doc.room_number}</span>
+                            </div>
                           </div>
-                          <span
-                            aria-label={isDoctorOpdActive(doc, currentTime) ? 'OPD Active' : 'OPD Idle'}
-                            className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-extrabold leading-4 ${
-                              isDoctorOpdActive(doc, currentTime)
-                                ? 'border-emerald-100 bg-emerald-50 text-emerald-600'
-                                : 'border-rose-100 bg-rose-50 text-rose-600'
-                            }`}
-                          >
-                            <span className={`h-1.5 w-1.5 rounded-full ${
-                              isDoctorOpdActive(doc, currentTime) ? 'bg-emerald-500' : 'bg-rose-400'
-                            }`} />
-                            {isDoctorOpdActive(doc, currentTime) ? 'Active' : 'Idle'}
-                          </span>
                         </div>
+                        <span
+                          aria-label={isDoctorOpdActive(doc, currentTime) ? 'OPD Active' : 'OPD Idle'}
+                          className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-extrabold leading-4 ${
+                            isDoctorOpdActive(doc, currentTime)
+                              ? 'border-emerald-100 bg-emerald-50 text-emerald-600'
+                              : 'border-rose-100 bg-rose-50 text-rose-600'
+                          }`}
+                        >
+                          <span className={`h-1.5 w-1.5 rounded-full ${
+                            isDoctorOpdActive(doc, currentTime) ? 'bg-emerald-500' : 'bg-rose-400'
+                          }`} />
+                          {isDoctorOpdActive(doc, currentTime) ? 'ACTIVE' : 'IDLE'}
+                        </span>
                       </div>
                       <div className="mt-2 flex min-h-5 items-center gap-1.5 pl-[3.125rem]" aria-label={`Doctor rating ${doc.rating.toFixed(1)} out of 5`}>
                         <div className="flex items-center text-amber-400">
@@ -1618,20 +2109,46 @@ function DoctorBookingDirectoryContent() {
                         <span className="text-[11px] font-bold text-slate-600">{doc.rating.toFixed(1)}/5</span>
                       </div>
 
-                      <div className="mt-3 flex min-h-16 items-start gap-2 rounded-2xl border border-blue-100 bg-gradient-to-br from-blue-50/80 to-slate-50 p-2.5 text-[11px] font-semibold text-slate-400">
-                        <Clock className="mt-1 h-3.5 w-3.5 shrink-0 text-blue-600" />
-                        <div className="grid min-w-0 flex-1 gap-1.5">
-                          {doc.opd_sessions.length > 0
-                            ? doc.opd_sessions.map((session) => (
-                                <span
-                                  key={session.shift}
-                                  className="flex min-h-7 items-center rounded-md bg-white px-2 py-1 leading-4 text-slate-600 shadow-xs"
-                                >
-                                  {formatOpdSessions([session])}
+                      <div
+                        className="mt-3 flex min-w-0 items-center gap-2"
+                        title={doc.opd_sessions.length > 0 ? formatOpdSessions(doc.opd_sessions) : `${doc.opd_timing} (${doc.opd_shift})`}
+                      >
+                        {doc.opd_sessions.length > 0
+                          ? doc.opd_sessions.map((session, index) => {
+                            return (
+                              <button
+                                type="button"
+                                data-schedule-tooltip-trigger
+                                key={`${session.shift}-${session.start_time}-${session.end_time}-${index}`}
+                                className="flex min-h-10 min-w-0 flex-1 items-center gap-1 overflow-hidden rounded-2xl border border-blue-100 bg-gradient-to-br from-blue-50/80 to-slate-50 px-2 py-2 text-left text-[10px] font-semibold text-slate-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
+                                title={formatOpdSessions([session])}
+                                aria-label={`${formatCompactOpdSessions([session])}. Tap to see full schedule.`}
+                                aria-describedby={scheduleTooltip?.id === `schedule-tooltip-${doc.id}-${index}` ? scheduleTooltip.id : undefined}
+                                onClick={(event) => toggleScheduleTooltip(event, `schedule-tooltip-${doc.id}-${index}`, formatOpdSessions([session]))}
+                              >
+                                <Clock className="h-3 w-3 shrink-0 text-blue-600" />
+                                <span className="min-w-0 truncate whitespace-nowrap leading-4">
+                                  {formatCompactOpdSessions([session])}
                                 </span>
-                              ))
-                            : <span className="flex min-h-7 items-center rounded-md bg-white px-2 py-1 leading-4 text-slate-600 shadow-xs">{doc.opd_timing} ({doc.opd_shift})</span>}
-                        </div>
+                              </button>
+                            );
+                          })
+                          : (
+                            <button
+                              type="button"
+                              data-schedule-tooltip-trigger
+                              className="flex min-h-10 min-w-0 flex-1 items-center gap-2 overflow-hidden rounded-2xl border border-blue-100 bg-gradient-to-br from-blue-50/80 to-slate-50 px-3 py-2 text-left text-[11px] font-semibold text-slate-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
+                              title={`${doc.opd_timing} (${doc.opd_shift})`}
+                              aria-label={`${doc.opd_timing} (${doc.opd_shift}). Tap to see full schedule.`}
+                              aria-describedby={scheduleTooltip?.id === `schedule-tooltip-${doc.id}-legacy` ? scheduleTooltip.id : undefined}
+                              onClick={(event) => toggleScheduleTooltip(event, `schedule-tooltip-${doc.id}-legacy`, `${doc.opd_timing} (${doc.opd_shift})`)}
+                            >
+                              <Clock className="h-3.5 w-3.5 shrink-0 text-blue-600" />
+                              <span className="min-w-0 truncate whitespace-nowrap leading-4">
+                                {`${doc.opd_timing} (${doc.opd_shift})`}
+                              </span>
+                            </button>
+                          )}
                       </div>
 
                       {getDoctorClosureReason(doc) && (
@@ -1647,25 +2164,8 @@ function DoctorBookingDirectoryContent() {
                         </div>
                       )}
 
-                      {/* Live Queue Broadcast */}
-                      {doc.current_token ? (
-                        <div className="mt-3.5 rounded-2xl border border-blue-200 bg-blue-50 px-3 py-2.5 text-xs">
-                          <div className="flex items-center gap-1.5 font-bold text-blue-700">
-                            <Users className="h-3.5 w-3.5" />
-                            <span>Now consulting</span>
-                          </div>
-                          <div className="mt-1 flex items-center justify-between gap-2">
-                            <span className="truncate font-semibold text-slate-700">
-                              {doc.current_patient_name || 'Current patient'}
-                            </span>
-                            <span className="shrink-0 rounded-md bg-white px-2 py-1 font-mono font-black text-blue-700 shadow-sm">
-                              {doc.current_token}
-                            </span>
-                          </div>
-                        </div>
-                      ) : null}
                       {(doc.waiting_count ?? 0) > 0 ? (
-                        <div className="mt-2 flex items-center justify-between rounded-2xl border border-slate-100 bg-slate-50 px-3 py-2 text-xs">
+                        <div className="mt-2 flex items-center justify-between rounded-2xl border border-blue-100 bg-gradient-to-br from-blue-50/80 to-slate-50 px-3 py-2 text-xs">
                           <span className="flex items-center gap-1.5 font-medium text-slate-500">
                             <Users className="h-3.5 w-3.5 text-blue-600" />
                             <span>Waiting in line</span>
@@ -1675,8 +2175,8 @@ function DoctorBookingDirectoryContent() {
                           </span>
                         </div>
                       ) : (
-                        <div className="mt-2 flex items-center gap-1.5 rounded-2xl border border-slate-100 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-500">
-                          <Users className="h-3.5 w-3.5 text-slate-400" />
+                        <div className="mt-2 flex items-center gap-1.5 rounded-2xl border border-blue-100 bg-gradient-to-br from-blue-50/80 to-slate-50 px-3 py-2 text-xs font-medium text-slate-500">
+                          <Users className="h-3.5 w-3.5 text-blue-600" />
                           <span>No patients waiting yet</span>
                         </div>
                       )}
@@ -1757,7 +2257,9 @@ function DoctorBookingDirectoryContent() {
                       ? 'bg-emerald-50 text-emerald-700'
                       : ticket.status === 'cancelled' || ticket.status === 'skipped'
                         ? 'bg-rose-50 text-rose-700'
-                        : 'bg-blue-50 text-blue-700';
+                        : ticket.status === 'expired'
+                          ? 'bg-slate-100 text-slate-600'
+                          : 'bg-blue-50 text-blue-700';
 
                     return (
                       <div key={ticket.id} className="flex items-center justify-between gap-4 rounded-2xl border border-slate-200 bg-white p-3.5 shadow-sm">
@@ -1767,7 +2269,9 @@ function DoctorBookingDirectoryContent() {
                           </div>
                           <div className="min-w-0">
                             <p className="truncate text-sm font-black text-slate-800">{doctor?.name || 'Doctor consultation'}</p>
-                            <p className="truncate text-[11px] text-slate-500">{doctor?.clinic_name || 'Clinic'} · {new Date(ticket.created_at).toLocaleDateString()}</p>
+                            <p className="truncate text-[11px] text-slate-500">
+                              {ticket.patient_name} · {doctor?.clinic_name || 'Clinic'} · {new Date(ticket.created_at).toLocaleDateString()}
+                            </p>
                           </div>
                         </div>
                         <span className={`shrink-0 rounded-full px-2.5 py-1 text-[10px] font-extrabold capitalize ${statusClass}`}>
@@ -2078,6 +2582,23 @@ function DoctorBookingDirectoryContent() {
             </form>
           </div>
         </div>
+      )}
+
+      {scheduleTooltip && typeof document !== 'undefined' && createPortal(
+        <div
+          id={scheduleTooltip.id}
+          data-schedule-tooltip
+          role="tooltip"
+          className="fixed z-[100] max-w-[calc(100vw-24px)] rounded-xl border border-blue-100 bg-white px-3 py-2 text-xs font-semibold text-slate-700 shadow-xl"
+          style={{
+            left: scheduleTooltip.left,
+            top: scheduleTooltip.top,
+            transform: scheduleTooltip.above ? 'translate(-50%, -100%)' : 'translateX(-50%)',
+          }}
+        >
+          {scheduleTooltip.text}
+        </div>,
+        document.body
       )}
 
     </div>
