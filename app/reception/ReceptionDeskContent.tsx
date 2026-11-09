@@ -132,8 +132,6 @@ export default function ReceptionDeskPage() {
   const [completionPaymentMode, setCompletionPaymentMode] = useState<'CASH' | 'UPI' | 'CARD' | 'OTHER' | 'NONE'>('CASH');
   const [completionError, setCompletionError] = useState('');
 
-  const [showTimingModal, setShowTimingModal] = useState<boolean>(false);
-  const [timingError, setTimingError] = useState('');
   const [newOpdSessions, setNewOpdSessions] = useState<OpdSession[]>([]);
   const [newWeeklyOffDays, setNewWeeklyOffDays] = useState<string[]>([]);
   const [newHolidayDates, setNewHolidayDates] = useState<string[]>([]);
@@ -907,76 +905,21 @@ export default function ReceptionDeskPage() {
     }
   };
 
-  // ACTION 6: Update Doctor OPD Timing & Shift
-  const handleUpdateTiming = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!currentDoctor) return;
-    if (newOpdSessions.length === 0) {
-      setTimingError('Add at least one consultation session.');
-      return;
-    }
-    const invalidSession = newOpdSessions.find((session) =>
-      !session.start_time ||
-      !session.end_time ||
-      session.start_time === session.end_time ||
-      (session.start_time > session.end_time && session.shift !== 'Night')
-    );
-    if (invalidSession) {
-      setTimingError(`${invalidSession.shift} OPD end time must be later than its start time. Check that the selected AM/PM values are correct.`);
-      return;
-    }
-
-    setTimingError('');
-    const firstSession = newOpdSessions[0];
-    const legacyTiming = formatLegacyOpdTiming(newOpdSessions);
-    setActionLoading(true);
-
-    try {
-      const { error } = await supabase
-        .from('doctors')
-        .update({
-          opd_timing: legacyTiming,
-          opd_shift: firstSession.shift,
-          opd_sessions: newOpdSessions,
-          weekly_off_days: newWeeklyOffDays,
-          opd_holiday_dates: newHolidayDates,
-        })
-        .eq('id', currentDoctor.id);
-
-      if (error) throw error;
-
-      setDoctors((previousDoctors) => previousDoctors.map((doctor) =>
-        doctor.id === currentDoctor.id
-          ? {
-              ...doctor,
-              opd_timing: legacyTiming,
-              opd_shift: firstSession.shift,
-              opd_sessions: newOpdSessions,
-              weekly_off_days: newWeeklyOffDays,
-              opd_holiday_dates: newHolidayDates,
-            }
-          : doctor
-      ));
-      setShowTimingModal(false);
-      setSuccessMsg(`Updated OPD schedule for ${currentDoctor.name}.`);
-    } catch (err: unknown) {
-      setTimingError(getErrorMessage(err, 'Failed to update the OPD schedule.'));
-    } finally {
-      setActionLoading(false);
-    }
-  };
-
   const openDoctorEdit = () => {
     if (!currentDoctor) return;
     setDoctorEditName(currentDoctor.name || '');
     setDoctorEditRoom(currentDoctor.room_number || '');
     setDoctorEditFee(String(currentDoctor.consultation_fee ?? 500));
     setDoctorEditError('');
+    setNewOpdSessions(getOpdSessions(currentDoctor.opd_sessions, currentDoctor.opd_shift, currentDoctor.opd_timing));
+    setNewWeeklyOffDays(currentDoctor.weekly_off_days || []);
+    setNewHolidayDates(currentDoctor.opd_holiday_dates || []);
+    setNewHolidayDate('');
     setShowDoctorProfile(false);
     setShowDoctorEdit(true);
   };
 
-  const handleUpdateDoctorDetails = async (e: React.FormEvent) => {
+  const handleUpdateDoctorProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!currentDoctor) return;
 
@@ -995,23 +938,58 @@ export default function ReceptionDeskPage() {
       setDoctorEditError('Enter a valid consultation fee.');
       return;
     }
+    if (newOpdSessions.length === 0) {
+      setDoctorEditError('Add at least one consultation session.');
+      return;
+    }
+    const invalidSession = newOpdSessions.find((session) =>
+      !session.start_time ||
+      !session.end_time ||
+      session.start_time === session.end_time ||
+      (session.start_time > session.end_time && session.shift !== 'Night')
+    );
+    if (invalidSession) {
+      setDoctorEditError(`${invalidSession.shift} OPD end time must be later than its start time. Check that the selected AM/PM values are correct.`);
+      return;
+    }
 
     setActionLoading(true);
     setDoctorEditError('');
+    const firstSession = newOpdSessions[0];
+    const legacyTiming = formatLegacyOpdTiming(newOpdSessions);
     try {
       const { error } = await supabase
         .from('doctors')
-        .update({ name, room_number: roomNumber, consultation_fee: fee })
+        .update({
+          name,
+          room_number: roomNumber,
+          consultation_fee: fee,
+          opd_timing: legacyTiming,
+          opd_shift: firstSession.shift,
+          opd_sessions: newOpdSessions,
+          weekly_off_days: newWeeklyOffDays,
+          opd_holiday_dates: newHolidayDates,
+        })
         .eq('id', currentDoctor.id);
       if (error) throw error;
 
       setDoctors((previousDoctors) => previousDoctors.map((doctor) =>
         doctor.id === currentDoctor.id
-          ? { ...doctor, name, room_number: roomNumber, consultation_fee: fee }
+          ? {
+              ...doctor,
+              name,
+              room_number: roomNumber,
+              consultation_fee: fee,
+              opd_timing: legacyTiming,
+              opd_shift: firstSession.shift,
+              opd_sessions: newOpdSessions,
+              weekly_off_days: newWeeklyOffDays,
+              opd_holiday_dates: newHolidayDates,
+            }
           : doctor
       ));
       setShowDoctorEdit(false);
-      setSuccessMsg('Doctor profile updated successfully.');
+      setSuccessMsg('Doctor profile and OPD schedule updated successfully.');
     } catch (error: unknown) {
       setDoctorEditError(getErrorMessage(error, 'Failed to update doctor profile.'));
     } finally {
@@ -1225,27 +1203,6 @@ export default function ReceptionDeskPage() {
                     <button
                       type="button"
                       onClick={() => {
-                        setTimingError('');
-                        setNewOpdSessions(currentDoctor
-                          ? getOpdSessions(currentDoctor.opd_sessions, currentDoctor.opd_shift, currentDoctor.opd_timing)
-                          : []);
-                        setNewWeeklyOffDays(currentDoctor?.weekly_off_days || []);
-                        setNewHolidayDates(currentDoctor?.opd_holiday_dates || []);
-                        setNewHolidayDate('');
-                        setShowDoctorProfile(false);
-                        setShowTimingModal(true);
-                      }}
-                      className="flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left text-xs font-bold text-slate-600 transition-colors hover:bg-blue-50 hover:text-blue-700"
-                      title="Edit doctor OPD schedule"
-                    >
-                      <span className="flex h-8 w-8 items-center justify-center rounded-xl bg-blue-50 text-blue-600">
-                        <Clock className="h-4 w-4" />
-                      </span>
-                      <span>Update timing</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
                         setClinicQrDataUrl('');
                         setClinicQrError('');
                         setShowDoctorProfile(false);
@@ -1267,7 +1224,7 @@ export default function ReceptionDeskPage() {
                       <span className="flex h-8 w-8 items-center justify-center rounded-xl bg-blue-50 text-blue-600">
                         <UserRound className="h-4 w-4" />
                       </span>
-                      <span>Edit doctor details</span>
+                      <span>Edit doctor profile</span>
                     </button>
                     <div className="my-1 border-t border-slate-100" />
                     <button
@@ -2325,35 +2282,6 @@ export default function ReceptionDeskPage() {
         </div>
       )}
 
-      {showDoctorEdit && currentDoctor && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-xs">
-          <form onSubmit={handleUpdateDoctorDetails} className="w-full max-w-sm rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl" role="dialog" aria-modal="true" aria-labelledby="edit-doctor-title">
-            <div className="mb-5 flex items-center justify-between">
-              <h3 id="edit-doctor-title" className="text-lg font-black text-slate-900">Edit doctor details</h3>
-              <button type="button" onClick={() => setShowDoctorEdit(false)} className="rounded-lg p-1 text-slate-400 hover:bg-slate-100" aria-label="Close edit doctor details">
-                <X className="h-5 w-5" />
-              </button>
-            </div>
-            {doctorEditError && <p role="alert" className="mb-4 rounded-xl bg-rose-50 p-3 text-xs font-semibold text-rose-700">{doctorEditError}</p>}
-            <div className="space-y-4">
-              <label className="block text-xs font-bold text-slate-700">Doctor name
-                <input value={doctorEditName} onChange={(event) => setDoctorEditName(event.target.value)} className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2.5 text-sm text-slate-900" />
-              </label>
-              <label className="block text-xs font-bold text-slate-700">Room number
-                <input value={doctorEditRoom} onChange={(event) => setDoctorEditRoom(event.target.value)} className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2.5 text-sm text-slate-900" />
-              </label>
-              <label className="block text-xs font-bold text-slate-700">Consultation fee
-                <input type="number" min="0" step="1" value={doctorEditFee} onChange={(event) => setDoctorEditFee(event.target.value)} className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2.5 text-sm text-slate-900" />
-              </label>
-            </div>
-            <div className="mt-6 flex justify-end gap-2">
-              <button type="button" onClick={() => setShowDoctorEdit(false)} className="rounded-xl border border-slate-300 px-4 py-2.5 text-xs font-bold text-slate-700 hover:bg-slate-50">Cancel</button>
-              <button type="submit" disabled={actionLoading} className="rounded-xl bg-blue-600 px-4 py-2.5 text-xs font-bold text-white hover:bg-blue-700 disabled:opacity-50">{actionLoading ? 'Saving...' : 'Save details'}</button>
-            </div>
-          </form>
-        </div>
-      )}
-
       {showClinicQrModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-xs">
           <div
@@ -2469,51 +2397,85 @@ export default function ReceptionDeskPage() {
         </div>
       )}
 
-            {/* MODAL: Update Doctor OPD Timing */}
-      {showTimingModal && (
-        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-2xl max-w-sm w-full max-h-[90vh] overflow-y-auto p-5 sm:p-6 shadow-2xl border border-slate-200">
-            <div className="flex justify-between items-center mb-4 pb-2 border-b border-slate-100">
-              <h3 className="text-base font-black text-slate-900">Set OPD Schedule</h3>
-              <button 
+      {/* MODAL: Edit Doctor Profile and OPD Schedule */}
+      {showDoctorEdit && currentDoctor && (
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-950/60 p-0 backdrop-blur-sm sm:items-center sm:p-4">
+          <form
+            onSubmit={handleUpdateDoctorProfile}
+            className="flex max-h-[92dvh] w-full max-w-2xl flex-col overflow-hidden rounded-t-3xl border border-slate-200 bg-white shadow-2xl sm:rounded-3xl"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="edit-doctor-title"
+          >
+            <div className="flex shrink-0 items-start justify-between gap-4 border-b border-blue-100 bg-gradient-to-br from-blue-50 via-white to-indigo-50 px-5 py-5 sm:px-7">
+              <div className="flex min-w-0 items-center gap-3">
+                <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-blue-600 text-lg font-black text-white shadow-lg shadow-blue-900/15">
+                  {(currentDoctor.name?.trim().charAt(0) || 'D').toUpperCase()}
+                </span>
+                <div className="min-w-0">
+                  <p className="mb-0.5 text-[10px] font-bold uppercase tracking-[0.16em] text-blue-600">Doctor profile</p>
+                  <h3 id="edit-doctor-title" className="truncate text-lg font-black text-slate-900">Edit doctor profile</h3>
+                  <p className="mt-0.5 truncate text-xs text-slate-500">{currentDoctor.clinic_name || 'Clinic'} · Room {currentDoctor.room_number}</p>
+                </div>
+              </div>
+              <button
+                type="button"
                 onClick={() => {
-                  setShowTimingModal(false);
-                  setTimingError('');
+                  setShowDoctorEdit(false);
+                  setDoctorEditError('');
                 }}
-                aria-label="Close OPD schedule"
-                className="text-slate-400 hover:text-slate-600 p-1 cursor-pointer"
+                aria-label="Close doctor profile editor"
+                className="rounded-xl p-2 text-slate-400 transition-colors hover:bg-white hover:text-slate-700"
               >
-                <X className="w-4 h-4" />
+                <X className="h-5 w-5" />
               </button>
             </div>
 
-            {timingError && (
-              <div
-                role="alert"
-                className="mb-4 flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs font-semibold text-rose-700"
-              >
-                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-500" />
-                <span>{timingError}</span>
-              </div>
-            )}
+            <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-5 sm:px-7">
+              {doctorEditError && (
+                <div
+                  role="alert"
+                  className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm font-semibold text-rose-700"
+                >
+                  <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-500" />
+                  <span>{doctorEditError}</span>
+                </div>
+              )}
 
-            <form onSubmit={handleUpdateTiming} className="space-y-4">
-              <div>
-                <label className="block text-xs font-bold text-slate-700 uppercase mb-1">
-                  Doctor
-                </label>
-                <input
-                  type="text"
-                  disabled
-                  value={currentDoctor?.name || ''}
-                  className="w-full bg-slate-100 border border-slate-200 rounded-xl px-3 py-2 text-xs font-bold text-slate-600"
-                />
-              </div>
+              <section className="rounded-2xl border border-slate-200 p-4 sm:p-5">
+                <div className="mb-4 flex items-center gap-3">
+                  <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-blue-50 text-blue-600"><UserRound className="h-4 w-4" /></span>
+                  <div>
+                    <h4 className="text-sm font-extrabold text-slate-900">Doctor details</h4>
+                    <p className="text-xs text-slate-500">Update the information shown to patients.</p>
+                  </div>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <label className="block text-xs font-bold text-slate-700">Doctor name
+                    <input required value={doctorEditName} onChange={(event) => setDoctorEditName(event.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-3 text-sm text-slate-900 outline-none transition focus:border-blue-400 focus:bg-white focus:ring-4 focus:ring-blue-100" />
+                  </label>
+                  <label className="block text-xs font-bold text-slate-700">Room number
+                    <input required value={doctorEditRoom} onChange={(event) => setDoctorEditRoom(event.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-3 text-sm text-slate-900 outline-none transition focus:border-blue-400 focus:bg-white focus:ring-4 focus:ring-blue-100" />
+                  </label>
+                  <label className="block text-xs font-bold text-slate-700 sm:col-span-2">Consultation fee
+                    <span className="relative mt-1.5 block">
+                      <IndianRupee className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                      <input required type="number" min="0" step="1" value={doctorEditFee} onChange={(event) => setDoctorEditFee(event.target.value)} className="w-full rounded-xl border border-slate-200 bg-slate-50 py-3 pl-9 pr-3.5 text-sm text-slate-900 outline-none transition focus:border-blue-400 focus:bg-white focus:ring-4 focus:ring-blue-100" />
+                    </span>
+                  </label>
+                </div>
+              </section>
 
-              <div>
-                <div className="mb-2">
-                  <h4 className="text-xs font-bold text-slate-700 uppercase">Consultation Sessions</h4>
-                  <p className="mt-1 text-[11px] text-slate-400">Add a morning or evening session, then choose its start and end time.</p>
+              <section className="rounded-2xl border border-slate-200 bg-slate-50/70 p-4 sm:p-5">
+                <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-violet-50 text-violet-600"><Clock className="h-4 w-4" /></span>
+                    <div>
+                      <h4 className="text-sm font-extrabold text-slate-900">OPD schedule</h4>
+                      <p className="text-xs text-slate-500">Set consultation hours for each session.</p>
+                    </div>
+                  </div>
+                  <span className="rounded-full bg-white px-2.5 py-1 text-[10px] font-bold text-slate-500 shadow-sm">{newOpdSessions.length} {newOpdSessions.length === 1 ? 'session' : 'sessions'}</span>
                 </div>
                 <div className="grid grid-cols-2 gap-2">
                   {OPD_SESSION_SHIFTS.map((shift) => {
@@ -2524,7 +2486,7 @@ export default function ReceptionDeskPage() {
                         type="button"
                         disabled={isAdded}
                         onClick={() => {
-                          setTimingError('');
+                          setDoctorEditError('');
                           const defaultTimes: Record<OpdSessionShift, [string, string]> = {
                             Morning: ['09:00', '12:00'],
                             Evening: ['17:00', '20:30'],
@@ -2533,7 +2495,7 @@ export default function ReceptionDeskPage() {
                           setNewOpdSessions((sessions) => [...sessions, { shift, start_time, end_time }]
                             .sort((first, second) => OPD_SHIFTS.indexOf(first.shift) - OPD_SHIFTS.indexOf(second.shift)));
                         }}
-                        className="rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-bold text-blue-700 hover:bg-blue-100 disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400"
+                        className="rounded-xl border border-blue-200 bg-white px-3 py-2.5 text-xs font-bold text-blue-700 shadow-sm transition hover:border-blue-300 hover:bg-blue-50 disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400"
                       >
                         {isAdded ? `${shift} added` : `+ Add ${shift}`}
                       </button>
@@ -2542,17 +2504,17 @@ export default function ReceptionDeskPage() {
                 </div>
                 <div className="mt-3 space-y-3">
                   {newOpdSessions.map((session, index) => (
-                    <div key={session.shift} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                    <div key={session.shift} className="rounded-xl border border-white bg-white p-3.5 shadow-sm">
                       <div className="mb-2 flex items-center justify-between">
                         <h5 className="text-xs font-bold text-slate-800">{session.shift} OPD</h5>
                         <button
                           type="button"
                           onClick={() => {
-                            setTimingError('');
+                            setDoctorEditError('');
                             setNewOpdSessions((sessions) => sessions.filter((item) => item.shift !== session.shift));
                           }}
                           aria-label={`Remove ${session.shift} session`}
-                          className="rounded-lg p-1 text-slate-400 hover:bg-white hover:text-rose-600"
+                          className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
                         >
                           <X className="h-4 w-4" />
                         </button>
@@ -2564,12 +2526,12 @@ export default function ReceptionDeskPage() {
                             required
                             value={session.start_time}
                             onChange={(event) => {
-                              setTimingError('');
+                              setDoctorEditError('');
                               setNewOpdSessions((sessions) => sessions.map((item, itemIndex) =>
                                 itemIndex === index ? { ...item, start_time: event.target.value } : item
                               ));
                             }}
-                            className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2.5 py-2 text-xs font-semibold text-slate-900 focus:ring-2 focus:ring-blue-500"
+                            className="mt-1.5 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs font-semibold text-slate-900 outline-none focus:border-blue-400 focus:bg-white focus:ring-4 focus:ring-blue-100"
                           >
                             {OPD_TIME_OPTIONS.map(({ value, label }) => (
                               <option key={value} value={value}>{label}</option>
@@ -2582,12 +2544,12 @@ export default function ReceptionDeskPage() {
                             required
                             value={session.end_time}
                             onChange={(event) => {
-                              setTimingError('');
+                              setDoctorEditError('');
                               setNewOpdSessions((sessions) => sessions.map((item, itemIndex) =>
                                 itemIndex === index ? { ...item, end_time: event.target.value } : item
                               ));
                             }}
-                            className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2.5 py-2 text-xs font-semibold text-slate-900 focus:ring-2 focus:ring-blue-500"
+                            className="mt-1.5 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs font-semibold text-slate-900 outline-none focus:border-blue-400 focus:bg-white focus:ring-4 focus:ring-blue-100"
                           >
                             {OPD_TIME_OPTIONS.map(({ value, label }) => (
                               <option key={value} value={value}>{label}</option>
@@ -2598,131 +2560,133 @@ export default function ReceptionDeskPage() {
                     </div>
                   ))}
                 </div>
-              </div>
+              </section>
 
-              <div>
-                <label htmlFor="weekly-off-day" className="block text-xs font-bold text-slate-700 uppercase mb-1">
-                  Weekly Off Days
-                </label>
-                <select
-                  id="weekly-off-day"
-                  value=""
-                  onChange={(event) => {
-                    setTimingError('');
-                    const selectedDay = event.target.value;
-                    if (selectedDay && !newWeeklyOffDays.includes(selectedDay)) {
-                      setNewWeeklyOffDays((days) => [...days, selectedDay].sort(
-                        (firstDay, secondDay) => WEEKDAYS.indexOf(firstDay) - WEEKDAYS.indexOf(secondDay)
-                      ));
-                    }
-                  }}
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-xs font-semibold text-slate-900 focus:ring-2 focus:ring-blue-500"
-                >
-                  <option value="">Select a day to add</option>
-                  {WEEKDAYS.filter((day) => !newWeeklyOffDays.includes(day)).map((day) => (
-                    <option key={day} value={day}>{day}</option>
-                  ))}
-                </select>
-                {newWeeklyOffDays.length > 0 ? (
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    {newWeeklyOffDays.map((day) => (
-                      <button
-                        key={day}
-                        type="button"
-                        onClick={() => {
-                          setTimingError('');
-                          setNewWeeklyOffDays((days) => days.filter((offDay) => offDay !== day));
-                        }}
-                        aria-label={`Remove ${day} as a weekly off day`}
-                        className="rounded-lg border border-slate-200 bg-slate-100 px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-200"
-                      >
-                        {day} ×
-                      </button>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <section className="rounded-2xl border border-slate-200 p-4">
+                  <h4 className="text-sm font-extrabold text-slate-900">Weekly off days</h4>
+                  <p className="mb-3 mt-1 text-xs text-slate-500">Choose days when the clinic is closed each week.</p>
+                  <label htmlFor="weekly-off-day" className="sr-only">Add a weekly off day</label>
+                  <select
+                    id="weekly-off-day"
+                    value=""
+                    onChange={(event) => {
+                      setDoctorEditError('');
+                      const selectedDay = event.target.value;
+                      if (selectedDay && !newWeeklyOffDays.includes(selectedDay)) {
+                        setNewWeeklyOffDays((days) => [...days, selectedDay].sort(
+                          (firstDay, secondDay) => WEEKDAYS.indexOf(firstDay) - WEEKDAYS.indexOf(secondDay)
+                        ));
+                      }
+                    }}
+                    className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs font-semibold text-slate-900 outline-none focus:border-blue-400 focus:bg-white focus:ring-4 focus:ring-blue-100"
+                  >
+                    <option value="">Select a day to add</option>
+                    {WEEKDAYS.filter((day) => !newWeeklyOffDays.includes(day)).map((day) => (
+                      <option key={day} value={day}>{day}</option>
                     ))}
-                  </div>
-                ) : (
-                  <p className="mt-1 text-[11px] text-slate-400">No weekly off days selected.</p>
-                )}
-              </div>
+                  </select>
+                  {newWeeklyOffDays.length > 0 ? (
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {newWeeklyOffDays.map((day) => (
+                        <button
+                          key={day}
+                          type="button"
+                          onClick={() => {
+                            setDoctorEditError('');
+                            setNewWeeklyOffDays((days) => days.filter((offDay) => offDay !== day));
+                          }}
+                          aria-label={`Remove ${day} as a weekly off day`}
+                          className="rounded-lg border border-blue-100 bg-blue-50 px-2.5 py-1.5 text-[11px] font-semibold text-blue-700 transition hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                        >
+                          {day} ×
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="mt-1 text-[11px] text-slate-400">No weekly off days selected.</p>
+                  )}
+                </section>
 
-              <div>
-                <label htmlFor="opd-holiday-date" className="block text-xs font-bold text-slate-700 uppercase mb-1">
-                  Holidays
-                </label>
-                <div className="flex gap-2">
-                  <input
-                    id="opd-holiday-date"
-                    type="date"
-                    min={getClinicDateString()}
-                    value={newHolidayDate}
-                    onChange={(event) => setNewHolidayDate(event.target.value)}
-                    className="min-w-0 flex-1 bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-900 focus:ring-2 focus:ring-blue-500"
-                  />
-                  <button
-                    type="button"
-                    disabled={
-                      !newHolidayDate ||
-                      newHolidayDate < getClinicDateString() ||
-                      newHolidayDates.includes(newHolidayDate)
-                    }
-                    onClick={() => {
-                      if (
+                <section className="rounded-2xl border border-slate-200 p-4">
+                  <h4 className="text-sm font-extrabold text-slate-900">Holiday dates</h4>
+                  <p className="mb-3 mt-1 text-xs text-slate-500">Add one-time dates when the clinic will be closed.</p>
+                  <div className="flex gap-2">
+                    <input
+                      id="opd-holiday-date"
+                      type="date"
+                      aria-label="Holiday date"
+                      min={getClinicDateString()}
+                      value={newHolidayDate}
+                      onChange={(event) => setNewHolidayDate(event.target.value)}
+                      className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs font-semibold text-slate-900 outline-none focus:border-blue-400 focus:bg-white focus:ring-4 focus:ring-blue-100"
+                    />
+                    <button
+                      type="button"
+                      disabled={
                         !newHolidayDate ||
                         newHolidayDate < getClinicDateString() ||
                         newHolidayDates.includes(newHolidayDate)
-                      ) return;
-                      setTimingError('');
-                      setNewHolidayDates((dates) => [...dates, newHolidayDate].sort());
-                      setNewHolidayDate('');
-                    }}
-                    className="rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-bold text-blue-700 hover:bg-blue-100 disabled:opacity-50"
-                  >
-                    Add date
-                  </button>
-                </div>
-                {newHolidayDates.length > 0 ? (
-                  <div className="mt-2 flex max-h-24 flex-wrap gap-2 overflow-y-auto">
-                    {newHolidayDates.map((holidayDate) => (
-                      <button
-                        key={holidayDate}
-                        type="button"
-                        onClick={() => {
-                          setTimingError('');
-                          setNewHolidayDates((dates) => dates.filter((date) => date !== holidayDate));
-                        }}
-                        aria-label={`Remove holiday on ${new Date(`${holidayDate}T00:00:00`).toLocaleDateString()}`}
-                        className="rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-800 hover:bg-amber-100"
-                      >
-                        {new Date(`${holidayDate}T00:00:00`).toLocaleDateString()} ×
-                      </button>
-                    ))}
+                      }
+                      onClick={() => {
+                        if (
+                          !newHolidayDate ||
+                          newHolidayDate < getClinicDateString() ||
+                          newHolidayDates.includes(newHolidayDate)
+                        ) return;
+                        setDoctorEditError('');
+                        setNewHolidayDates((dates) => [...dates, newHolidayDate].sort());
+                        setNewHolidayDate('');
+                      }}
+                      className="rounded-xl border border-blue-200 bg-blue-50 px-3 py-2.5 text-xs font-bold text-blue-700 transition hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      Add date
+                    </button>
                   </div>
-                ) : (
-                  <p className="mt-1 text-[11px] text-slate-400">No additional holidays scheduled.</p>
-                )}
+                  {newHolidayDates.length > 0 ? (
+                    <div className="mt-2 flex max-h-24 flex-wrap gap-2 overflow-y-auto">
+                      {newHolidayDates.map((holidayDate) => (
+                        <button
+                          key={holidayDate}
+                          type="button"
+                          onClick={() => {
+                            setDoctorEditError('');
+                            setNewHolidayDates((dates) => dates.filter((date) => date !== holidayDate));
+                          }}
+                          aria-label={`Remove holiday on ${new Date(`${holidayDate}T00:00:00`).toLocaleDateString()}`}
+                          className="rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-800 hover:bg-amber-100"
+                        >
+                          {new Date(`${holidayDate}T00:00:00`).toLocaleDateString()} ×
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="mt-1 text-[11px] text-slate-400">No additional holidays scheduled.</p>
+                  )}
+                </section>
               </div>
+            </div>
 
-              <div className="flex justify-end gap-2 pt-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowTimingModal(false);
-                    setTimingError('');
-                  }}
-                  className="px-3 py-2 rounded-xl border border-slate-200 text-xs font-bold text-slate-600 hover:bg-slate-50 cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={actionLoading}
-                  className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-xs font-bold text-white shadow-md disabled:opacity-50 cursor-pointer"
-                >
-                  {actionLoading ? 'Saving...' : 'Save Timing'}
-                </button>
-              </div>
-            </form>
-          </div>
+            <div className="flex shrink-0 justify-end gap-2 border-t border-slate-200 bg-white px-5 py-4 sm:px-7">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowDoctorEdit(false);
+                  setDoctorEditError('');
+                }}
+                className="rounded-xl border border-slate-200 px-4 py-2.5 text-xs font-bold text-slate-600 transition hover:bg-slate-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={actionLoading}
+                className="inline-flex min-w-32 items-center justify-center rounded-xl bg-blue-600 px-5 py-2.5 text-xs font-bold text-white shadow-md shadow-blue-900/15 transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {actionLoading ? 'Saving...' : 'Save changes'}
+              </button>
+            </div>
+          </form>
         </div>
       )}
 
