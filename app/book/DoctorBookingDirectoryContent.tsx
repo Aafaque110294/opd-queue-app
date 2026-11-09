@@ -1552,7 +1552,7 @@ function DoctorBookingDirectoryContent() {
       )}
 
       {/* Header Banner */}
-      <header className="bg-slate-950 text-white border-b border-slate-800">
+      <header className="sticky top-0 z-30 bg-slate-950 text-white border-b border-slate-800">
         <div className="max-w-5xl mx-auto px-4 sm:px-6 py-5 sm:py-8">
           <div className="flex flex-col gap-4 sm:gap-5">
             <div className="flex w-full flex-wrap items-center justify-between gap-3 sm:flex-nowrap sm:gap-4">
@@ -1705,7 +1705,7 @@ function DoctorBookingDirectoryContent() {
 
           {/* Search Box */}
           {activeTab === 'DIRECTORY' && (
-          <div className="relative w-full max-w-2xl">
+          <div className="relative mt-8 w-full max-w-2xl">
               <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-slate-400">
                 <Search className="w-5 h-5" />
               </div>

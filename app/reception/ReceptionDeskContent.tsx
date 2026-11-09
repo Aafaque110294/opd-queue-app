@@ -154,6 +154,20 @@ export default function ReceptionDeskPage() {
   const [clinicQrDataUrl, setClinicQrDataUrl] = useState('');
   const [clinicQrError, setClinicQrError] = useState('');
   const callChimeAudioContextRef = useRef<AudioContext | null>(null);
+  const doctorProfileRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!showDoctorProfile) return;
+
+    const closeDoctorProfileOnOutsideClick = (event: PointerEvent) => {
+      if (event.target instanceof Node && !doctorProfileRef.current?.contains(event.target)) {
+        setShowDoctorProfile(false);
+      }
+    };
+
+    document.addEventListener('pointerdown', closeDoctorProfileOnOutsideClick);
+    return () => document.removeEventListener('pointerdown', closeDoctorProfileOnOutsideClick);
+  }, [showDoctorProfile]);
 
   const clinicBookingUrl = useMemo(() => {
     if (!currentDoctor?.clinic_id || typeof window === 'undefined') return '';
@@ -604,21 +618,9 @@ export default function ReceptionDeskPage() {
           },
           body: JSON.stringify({ ticketId: nextTicket.id }),
         });
-        const result = await readPushNotificationResponse(pushResponse);
-        if (result.duplicate) {
-          setErrorMsg(`Token ${nextTicket.token_number} was called, but its push alert was already processed.`);
-        } else if (result.sent === 0) {
-          setErrorMsg(
-            `Token ${nextTicket.token_number} was called successfully, but no patient device is subscribed for alerts. Enable Call alerts from the patient profile menu while this token is active.`
-          );
-        } else if (typeof result.sent === 'number') {
-          setSuccessMsg(
-            `Called Token ${nextTicket.token_number} (${nextTicket.patient_name}). Push submitted to ${result.sent} patient device(s).`
-          );
-        }
+        await readPushNotificationResponse(pushResponse);
       } catch (pushError: unknown) {
         console.error('Patient call push notification failed:', pushError);
-        setErrorMsg(`Token ${nextTicket.token_number} was called successfully, but the patient background notification failed: ${getErrorMessage(pushError, 'Unknown push delivery error')}`);
       }
       fetchDoctorQueue(currentDoctor.department_id, currentDoctor.id);
     } catch (err: unknown) {
@@ -1095,7 +1097,7 @@ export default function ReceptionDeskPage() {
   return (
     <div className="min-h-screen bg-slate-100 flex flex-col justify-between">
       {/* Top Header */}
-      <header className="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-xs">
+      <header className="bg-blue-50 border-b border-slate-200 sticky top-0 z-30 shadow-xs">
         <div className="max-w-7xl mx-auto px-4 py-3 sm:px-6 lg:px-8 min-h-20 flex flex-col gap-3 lg:h-20 lg:flex-row lg:items-center lg:justify-between lg:py-0">
           <div className="flex min-w-0 items-center space-x-3">
             
@@ -1116,7 +1118,7 @@ export default function ReceptionDeskPage() {
             </div>
           </div>
 
-          <div className="grid grid-cols-3 items-stretch gap-1.5 sm:gap-2 lg:flex lg:flex-wrap lg:items-center lg:gap-3">
+          <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_max-content] items-stretch gap-1.5 sm:gap-2 lg:flex lg:flex-wrap lg:items-center lg:gap-3">
             {/* Show Dropdown only if in Multi-Doctor Hospital mode */}
             {!isSoloClinicMode && (
               <div className="col-span-3 flex min-w-0 items-center space-x-2 rounded-xl border border-slate-300 bg-slate-50 p-1.5 lg:col-span-1">
@@ -1142,7 +1144,7 @@ export default function ReceptionDeskPage() {
             {/* Quick Add Walk-in Button */}
             <button
               onClick={() => setShowWalkinModal(true)}
-              className="flex min-w-0 items-center justify-center gap-1 rounded-xl bg-blue-600 px-1.5 py-2 text-[10px] font-bold text-white shadow-md transition-colors hover:bg-blue-700 cursor-pointer sm:gap-1.5 sm:px-2.5 sm:py-2.5 sm:text-xs lg:gap-2 lg:px-4"
+              className="flex min-w-0 items-center justify-center gap-1 rounded-xl bg-blue-600 px-1.5 py-2 text-[10px] font-bold text-white shadow-sm transition-colors hover:bg-blue-700 sm:gap-1.5 sm:px-2.5 sm:py-2.5 sm:text-xs lg:gap-2 lg:px-4"
             >
               <UserPlus className="h-3.5 w-3.5 shrink-0 sm:h-4 sm:w-4" />
               <span className="truncate">+ Add Walk-In</span>
@@ -1152,7 +1154,7 @@ export default function ReceptionDeskPage() {
             <button
               onClick={() => setShowQuickTokenModal(true)}
               disabled={actionLoading || !currentDoctor}
-              className="flex min-w-0 items-center justify-center gap-1 rounded-xl border border-emerald-200 bg-emerald-50 px-1.5 py-2 text-[10px] font-bold text-emerald-700 transition-colors hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-50 sm:gap-1.5 sm:px-2.5 sm:py-2.5 sm:text-xs lg:gap-2 lg:px-4"
+              className="flex min-w-0 items-center justify-center gap-1 rounded-xl bg-blue-600 px-1.5 py-2 text-[10px] font-bold text-white shadow-sm transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50 sm:gap-1.5 sm:px-2.5 sm:py-2.5 sm:text-xs lg:gap-2 lg:px-4"
               title="Generate a token without entering patient details"
             >
               <Printer className="h-3.5 w-3.5 shrink-0 sm:h-4 sm:w-4" />
@@ -1160,19 +1162,19 @@ export default function ReceptionDeskPage() {
             </button>
 
             {/* Doctor Profile */}
-            <div className="relative min-w-0">
+            <div ref={doctorProfileRef} className="relative min-w-0 max-w-[45vw]">
               <button
                 onClick={() => setShowDoctorProfile((open) => !open)}
                 disabled={!currentDoctor}
-                className="group flex min-w-0 w-full items-center justify-center gap-1 rounded-xl border border-blue-200 bg-blue-50 px-1.5 py-2 text-left text-[10px] font-bold text-blue-800 shadow-sm transition-all hover:border-blue-300 hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-50 sm:gap-1.5 sm:px-2.5 sm:py-2.5 sm:text-xs lg:gap-2 lg:px-4"
+                className="group flex min-w-0 w-full items-center justify-center gap-1 rounded-xl bg-blue-600 px-1.5 py-2 text-[10px] font-bold text-white shadow-sm transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50 sm:gap-1.5 sm:px-2.5 sm:py-2.5 sm:text-xs lg:gap-2 lg:px-4"
                 title="Open doctor profile"
                 aria-expanded={showDoctorProfile}
               >
-                <span className="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-lg bg-blue-600 text-[8px] font-black text-white shadow-sm sm:h-4 sm:w-4 sm:rounded-lg sm:text-[9px]">
+                <span className="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-lg bg-white/20 text-[8px] font-black text-white sm:h-4 sm:w-4 sm:rounded-lg sm:text-[9px]">
                   {(currentDoctor?.name?.trim().charAt(0) || 'D').toUpperCase()}
                 </span>
-                <span className="min-w-0 max-w-32 truncate">{currentDoctor?.name || 'Doctor'}</span>
-                <ChevronDown className={`h-3.5 w-3.5 shrink-0 text-blue-400 transition-transform group-hover:text-blue-700 sm:h-4 sm:w-4 ${showDoctorProfile ? 'rotate-180' : ''}`} />
+                <span className="min-w-0 truncate">{currentDoctor?.name || 'Doctor'}</span>
+                <ChevronDown className={`h-3.5 w-3.5 shrink-0 text-blue-100 transition-transform group-hover:text-white sm:h-4 sm:w-4 ${showDoctorProfile ? 'rotate-180' : ''}`} />
               </button>
 
               {showDoctorProfile && currentDoctor && (
@@ -1299,20 +1301,22 @@ export default function ReceptionDeskPage() {
                     <h2 className="truncate text-lg font-bold text-slate-900">{currentDoctor?.name || 'Doctor'}</h2>
                     <p className="text-xs text-slate-500">Currently in consultation</p>
                   </div>
-                  <span className="shrink-0 rounded-lg bg-emerald-100 px-3 py-1 text-xs font-black text-emerald-800">
-                    {currentDoctor ? currentDoctor.room_number : 'Room 1'}
-                  </span>
                 </div>
 
-                {currentPatient ? (
-                  <span className="shrink-0 rounded-full bg-emerald-100 px-3 py-1 text-xs font-black text-emerald-800 animate-pulse">
-                    Inside Cabin
+                <div className="ml-auto flex shrink-0 items-center gap-2">
+                  <span className="shrink-0 rounded-lg bg-emerald-100 px-3 py-1 text-xs font-black text-emerald-800">
+                    Room {currentDoctor ? currentDoctor.room_number : '1'}
                   </span>
-                ) : (
-                  <span className="shrink-0 rounded-full bg-slate-100 px-3 py-1 text-xs font-bold text-slate-500">
-                    Cabin Ready / Empty
-                  </span>
-                )}
+                  {currentPatient ? (
+                    <span className="shrink-0 rounded-full bg-emerald-100 px-3 py-1 text-xs font-black text-emerald-800 animate-pulse">
+                      In Cabin
+                    </span>
+                  ) : (
+                    <span className="shrink-0 rounded-full bg-slate-100 px-3 py-1 text-xs font-bold text-slate-500">
+                      Ready
+                    </span>
+                  )}
+                </div>
               </div>
 
               {currentPatient ? (
