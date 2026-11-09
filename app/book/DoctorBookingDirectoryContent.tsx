@@ -1525,7 +1525,7 @@ function DoctorBookingDirectoryContent() {
                   setActiveTab('DIRECTORY');
                   setConfirmedTicket(null);
                 }}
-                className="whitespace-nowrap rounded-xl bg-blue-600 px-3 py-2 text-xs font-bold text-white shadow-lg shadow-blue-900/20 transition-all hover:bg-blue-500 hover:shadow-blue-900/30 cursor-pointer sm:px-4 sm:py-2.5"
+                className="min-h-10 whitespace-nowrap rounded-xl bg-blue-600 px-3 py-2 text-xs font-bold text-white shadow-lg shadow-blue-900/20 transition-all hover:bg-blue-500 hover:shadow-blue-900/30 cursor-pointer sm:min-h-11 sm:px-4 sm:py-2.5"
               >
                 Book New Token
               </button>
@@ -1536,12 +1536,12 @@ function DoctorBookingDirectoryContent() {
                     type="button"
                     aria-expanded={showProfileMenu}
                     onClick={() => setShowProfileMenu((open) => !open)}
-                    className="group flex min-w-0 max-w-40 items-center gap-1.5 rounded-2xl border border-slate-700 bg-slate-900 px-2 py-1.5 text-left shadow-lg shadow-black/10 transition-all hover:border-blue-400 hover:bg-slate-800 cursor-pointer sm:max-w-56 sm:gap-2 sm:px-2.5 sm:py-2"
+                    className="group flex min-h-10 min-w-0 max-w-56 items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-900 px-2 py-2 text-left shadow-lg shadow-black/10 transition-all hover:border-blue-400 hover:bg-slate-800 cursor-pointer sm:min-h-11 sm:gap-2 sm:px-2.5 sm:py-2.5"
                   >
-                    <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-blue-400 to-indigo-500 text-[10px] font-black text-white shadow-inner sm:h-8 sm:w-8 sm:rounded-xl sm:text-xs">
+                    <span className="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-blue-400 to-indigo-500 text-[8px] font-black text-white shadow-inner sm:h-4 sm:w-4 sm:text-[9px]">
                       {(String(currentUser.user_metadata?.full_name || currentUser.email || 'P').trim().charAt(0) || 'P').toUpperCase()}
                     </span>
-                    <span className="min-w-0 max-w-28 truncate text-[10px] font-bold text-white sm:text-xs">
+                    <span className="min-w-0 max-w-32 truncate text-[10px] font-bold text-white sm:text-xs">
                       {String(currentUser.user_metadata?.full_name || currentUser.email || 'Patient')}
                     </span>
                     <ChevronDown className={`h-3 w-3 shrink-0 text-slate-400 transition-transform group-hover:text-white sm:h-3.5 sm:w-3.5 ${showProfileMenu ? 'rotate-180' : ''}`} />

@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { useSearchParams, useRouter, usePathname } from 'next/navigation';
 import { supabase } from '@/lib/supabase/client';
+import QRCode from 'qrcode';
 
 import { 
   Users, 
@@ -27,16 +28,16 @@ import {
   VenusAndMars,
   FileText,
   Download,
+  QrCode,
   Search,
+  ChevronDown,
   ChevronLeft,
   ChevronRight
 } from 'lucide-react';
 import { Department, Doctor } from '@/lib/types';
 import { getClinicDateRange, getClinicDateString, getClinicDayRange } from '@/lib/clinic-day';
 import {
-  formatCompactOpdSessions,
   formatLegacyOpdTiming,
-  formatOpdSessions,
   getOpdSessions,
   OPD_SESSION_SHIFTS,
   OPD_TIME_OPTIONS,
@@ -115,6 +116,7 @@ export default function ReceptionDeskPage() {
   const [previousDayConsultation, setPreviousDayConsultation] = useState<QueueTicket | null>(null);
   const [activeReceptionSection, setActiveReceptionSection] = useState<'queue' | 'history'>('queue');
   const [todayCompletedCount, setTodayCompletedCount] = useState<number>(0);
+  const [todayCollection, setTodayCollection] = useState<number>(0);
   const [historyTickets, setHistoryTickets] = useState<QueueTicket[]>([]);
   const [historyStartDate, setHistoryStartDate] = useState(getClinicDateString());
   const [historyEndDate, setHistoryEndDate] = useState(getClinicDateString());
@@ -137,6 +139,12 @@ export default function ReceptionDeskPage() {
   const [newHolidayDates, setNewHolidayDates] = useState<string[]>([]);
   const [newHolidayDate, setNewHolidayDate] = useState('');
   const [showLogoutModal, setShowLogoutModal] = useState<boolean>(false);
+  const [showDoctorProfile, setShowDoctorProfile] = useState(false);
+  const [showDoctorEdit, setShowDoctorEdit] = useState(false);
+  const [doctorEditName, setDoctorEditName] = useState('');
+  const [doctorEditRoom, setDoctorEditRoom] = useState('');
+  const [doctorEditFee, setDoctorEditFee] = useState('');
+  const [doctorEditError, setDoctorEditError] = useState('');
   const [showQuickTokenModal, setShowQuickTokenModal] = useState<boolean>(false);
   const [ticketToReactivate, setTicketToReactivate] = useState<QueueTicket | null>(null);
 
@@ -144,7 +152,48 @@ export default function ReceptionDeskPage() {
   const [actionLoading, setActionLoading] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [successMsg, setSuccessMsg] = useState<string>('');
+  const [showClinicQrModal, setShowClinicQrModal] = useState(false);
+  const [clinicQrDataUrl, setClinicQrDataUrl] = useState('');
+  const [clinicQrError, setClinicQrError] = useState('');
   const callChimeAudioContextRef = useRef<AudioContext | null>(null);
+
+  const clinicBookingUrl = useMemo(() => {
+    if (!currentDoctor?.clinic_id || typeof window === 'undefined') return '';
+    const url = new URL('/book', window.location.origin);
+    url.searchParams.set('clinic_id', currentDoctor.clinic_id);
+    return url.toString();
+  }, [currentDoctor]);
+
+  useEffect(() => {
+    if (!showClinicQrModal || !clinicBookingUrl) return;
+    let active = true;
+    void QRCode.toDataURL(clinicBookingUrl, {
+      width: 320,
+      margin: 2,
+      errorCorrectionLevel: 'H',
+      color: { dark: '#0f172a', light: '#ffffff' },
+    }).then((dataUrl) => {
+      if (active) setClinicQrDataUrl(dataUrl);
+    }).catch((error: unknown) => {
+      console.error('Unable to generate clinic booking QR code:', error);
+      if (active) {
+        setClinicQrDataUrl('');
+        setClinicQrError('Unable to generate the QR code. Please try again.');
+      }
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [showClinicQrModal, clinicBookingUrl]);
+
+  const downloadClinicQr = () => {
+    if (!clinicQrDataUrl) return;
+    const link = document.createElement('a');
+    link.href = clinicQrDataUrl;
+    link.download = `${currentDoctor?.clinic_name || 'clinic'}-booking-qr.png`;
+    link.click();
+  };
 
   const prepareCallChime = () => {
     if (!window.AudioContext) return null;
@@ -374,6 +423,7 @@ export default function ReceptionDeskPage() {
       // Track completed patients today for clinic metrics
       const completed = tickets.filter((t) => t.status === 'completed');
       setTodayCompletedCount(completed.length);
+      setTodayCollection(completed.reduce((total, ticket) => total + (ticket.paid_amount ?? 0), 0));
 
       // Filter and sort waiting queue by priority
       const waiting = tickets.filter((t) => t.status === 'waiting');
@@ -812,6 +862,7 @@ export default function ReceptionDeskPage() {
     // Trigger Pause Button: If live, open modal. If paused, instantly resume.
   const handleTogglePauseClick = async () => {
     if (!currentDoctor) return;
+    setShowDoctorProfile(false);
     if (isOpdPaused) {
       // INSTANT RESUME: Clear message and set to LIVE
       await executePauseResume('LIVE', null);
@@ -915,8 +966,62 @@ export default function ReceptionDeskPage() {
     }
   };
 
+  const openDoctorEdit = () => {
+    if (!currentDoctor) return;
+    setDoctorEditName(currentDoctor.name || '');
+    setDoctorEditRoom(currentDoctor.room_number || '');
+    setDoctorEditFee(String(currentDoctor.consultation_fee ?? 500));
+    setDoctorEditError('');
+    setShowDoctorProfile(false);
+    setShowDoctorEdit(true);
+  };
+
+  const handleUpdateDoctorDetails = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!currentDoctor) return;
+
+    const name = doctorEditName.trim();
+    const roomNumber = doctorEditRoom.trim();
+    const fee = Number(doctorEditFee);
+    if (!name) {
+      setDoctorEditError('Doctor name is required.');
+      return;
+    }
+    if (!roomNumber) {
+      setDoctorEditError('Room number is required.');
+      return;
+    }
+    if (!Number.isFinite(fee) || fee < 0) {
+      setDoctorEditError('Enter a valid consultation fee.');
+      return;
+    }
+
+    setActionLoading(true);
+    setDoctorEditError('');
+    try {
+      const { error } = await supabase
+        .from('doctors')
+        .update({ name, room_number: roomNumber, consultation_fee: fee })
+        .eq('id', currentDoctor.id);
+      if (error) throw error;
+
+      setDoctors((previousDoctors) => previousDoctors.map((doctor) =>
+        doctor.id === currentDoctor.id
+          ? { ...doctor, name, room_number: roomNumber, consultation_fee: fee }
+          : doctor
+      ));
+      setShowDoctorEdit(false);
+      setSuccessMsg('Doctor profile updated successfully.');
+    } catch (error: unknown) {
+      setDoctorEditError(getErrorMessage(error, 'Failed to update doctor profile.'));
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
   // ACTION 7: Show sign-out confirmation
   const handleLogout = async () => {
+    setShowDoctorProfile(false);
     setShowLogoutModal(true);
   };
 
@@ -933,7 +1038,6 @@ export default function ReceptionDeskPage() {
   };
 
   const consultationFee = currentDoctor?.consultation_fee ?? 500;
-  const estimatedCollection = todayCompletedCount * consultationFee;
 
   const filteredHistoryTickets = useMemo(() => {
     const query = historySearch.trim().toLowerCase();
@@ -1057,47 +1161,6 @@ export default function ReceptionDeskPage() {
               </div>
             )}
 
-            {/* OPD Shift & Timing Badge */}
-            <button
-              onClick={() => {
-                setTimingError('');
-                setNewOpdSessions(currentDoctor
-                  ? getOpdSessions(currentDoctor.opd_sessions, currentDoctor.opd_shift, currentDoctor.opd_timing)
-                  : []);
-                setNewWeeklyOffDays(currentDoctor?.weekly_off_days || []);
-                setNewHolidayDates(currentDoctor?.opd_holiday_dates || []);
-                setNewHolidayDate('');
-                setShowTimingModal(true);
-              }}
-              className="col-span-3 flex min-w-0 items-center justify-center gap-2 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-bold text-blue-700 transition-colors hover:bg-blue-100 cursor-pointer lg:col-span-1"
-              title="Click to edit doctor OPD schedule"
-            >
-              <Clock className="h-3.5 w-3.5 shrink-0 text-blue-600" />
-              <span className="min-w-0 max-w-[min(34rem,45vw)] truncate text-left leading-4" title={currentDoctor
-                ? formatOpdSessions(getOpdSessions(currentDoctor.opd_sessions, currentDoctor.opd_shift, currentDoctor.opd_timing))
-                  || `${currentDoctor.opd_shift || 'Morning'}: ${currentDoctor.opd_timing || '10:00 AM - 01:00 PM'}`
-                : 'Set OPD hours'}>
-                {currentDoctor
-                  ? formatCompactOpdSessions(getOpdSessions(currentDoctor.opd_sessions, currentDoctor.opd_shift, currentDoctor.opd_timing))
-                    || `${currentDoctor.opd_shift || 'Morning'}: ${currentDoctor.opd_timing || '10:00 AM - 01:00 PM'}`
-                  : 'Set OPD hours'}
-              </span>
-              <span className="shrink-0 text-[10px] text-blue-500 underline">Edit</span>
-            </button>
-
-            {/* Emergency Broadcast / Pause OPD Button */}
-            <button
-              onClick={handleTogglePauseClick}
-              className={`flex min-w-0 items-center justify-center gap-1 rounded-xl px-1.5 py-2 text-[10px] font-bold transition-all shadow-xs cursor-pointer sm:gap-1.5 sm:px-2.5 sm:py-2.5 sm:text-xs lg:gap-2 lg:px-4 ${
-                isOpdPaused
-                  ? 'bg-amber-600 hover:bg-amber-700 text-white animate-pulse'
-                  : 'bg-slate-200 hover:bg-slate-300 text-slate-700'
-              }`}
-            >
-              {isOpdPaused ? <PlayCircle className="h-3.5 w-3.5 shrink-0 sm:h-4 sm:w-4" /> : <PauseCircle className="h-3.5 w-3.5 shrink-0 sm:h-4 sm:w-4" />}
-              <span className="truncate">{isOpdPaused ? 'Resume OPD' : 'Pause OPD'}</span>
-            </button>
-
             {/* Quick Add Walk-in Button */}
             <button
               onClick={() => setShowWalkinModal(true)}
@@ -1118,15 +1181,109 @@ export default function ReceptionDeskPage() {
               <span className="truncate">Quick Token</span>
             </button>
 
-            {/* Log Out Button */}
-            <button
-              onClick={handleLogout}
-              className="flex min-w-0 items-center justify-center gap-1 rounded-xl border border-slate-200 bg-slate-100 px-1.5 py-2 text-[10px] font-bold text-slate-600 transition-all hover:border-blue-200 hover:bg-blue-50 hover:text-blue-600 cursor-pointer sm:gap-1.5 sm:px-2.5 sm:py-2.5 sm:text-xs lg:px-3"
-              title="Log Out of Clinic Session"
-            >
-              <LogOut className="h-3.5 w-3.5 shrink-0 sm:h-4 sm:w-4" />
-              <span className="truncate">Log Out</span>
-            </button>
+            {/* Doctor Profile */}
+            <div className="relative min-w-0">
+              <button
+                onClick={() => setShowDoctorProfile((open) => !open)}
+                disabled={!currentDoctor}
+                className="group flex min-w-0 w-full items-center justify-center gap-1 rounded-xl border border-blue-200 bg-blue-50 px-1.5 py-2 text-left text-[10px] font-bold text-blue-800 shadow-sm transition-all hover:border-blue-300 hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-50 sm:gap-1.5 sm:px-2.5 sm:py-2.5 sm:text-xs lg:gap-2 lg:px-4"
+                title="Open doctor profile"
+                aria-expanded={showDoctorProfile}
+              >
+                <span className="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-lg bg-blue-600 text-[8px] font-black text-white shadow-sm sm:h-4 sm:w-4 sm:rounded-lg sm:text-[9px]">
+                  {(currentDoctor?.name?.trim().charAt(0) || 'D').toUpperCase()}
+                </span>
+                <span className="min-w-0 max-w-32 truncate">{currentDoctor?.name || 'Doctor'}</span>
+                <ChevronDown className={`h-3.5 w-3.5 shrink-0 text-blue-400 transition-transform group-hover:text-blue-700 sm:h-4 sm:w-4 ${showDoctorProfile ? 'rotate-180' : ''}`} />
+              </button>
+
+              {showDoctorProfile && currentDoctor && (
+                <div className="absolute right-0 top-[calc(100%+0.75rem)] z-40 w-64 overflow-hidden rounded-3xl border border-slate-200 bg-white text-slate-900 shadow-2xl shadow-slate-950/20">
+                  <div className="border-b border-blue-100 bg-blue-50 px-4 py-4 text-slate-900">
+                    <div className="flex items-center gap-3">
+                      <span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-blue-600 text-base font-black text-white shadow-sm">
+                        {(currentDoctor.name?.trim().charAt(0) || 'D').toUpperCase()}
+                      </span>
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-black">{currentDoctor.name}</p>
+                        <p className="truncate text-[11px] text-slate-500">{currentDoctor.clinic_name || 'Clinic'} · Room {currentDoctor.room_number}</p>
+                      </div>
+                    </div>
+                    <p className="mt-3 text-[10px] font-bold uppercase tracking-[0.16em] text-blue-600">Doctor profile</p>
+                  </div>
+                  <div className="space-y-1 p-2">
+                    <button
+                      type="button"
+                      onClick={() => void handleTogglePauseClick()}
+                      className="flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left text-xs font-bold text-slate-600 transition-colors hover:bg-amber-50 hover:text-amber-700"
+                    >
+                      <span className="flex h-8 w-8 items-center justify-center rounded-xl bg-amber-50 text-amber-600">
+                        {isOpdPaused ? <PlayCircle className="h-4 w-4" /> : <PauseCircle className="h-4 w-4" />}
+                      </span>
+                      <span>{isOpdPaused ? 'Resume OPD' : 'Pause OPD'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setTimingError('');
+                        setNewOpdSessions(currentDoctor
+                          ? getOpdSessions(currentDoctor.opd_sessions, currentDoctor.opd_shift, currentDoctor.opd_timing)
+                          : []);
+                        setNewWeeklyOffDays(currentDoctor?.weekly_off_days || []);
+                        setNewHolidayDates(currentDoctor?.opd_holiday_dates || []);
+                        setNewHolidayDate('');
+                        setShowDoctorProfile(false);
+                        setShowTimingModal(true);
+                      }}
+                      className="flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left text-xs font-bold text-slate-600 transition-colors hover:bg-blue-50 hover:text-blue-700"
+                      title="Edit doctor OPD schedule"
+                    >
+                      <span className="flex h-8 w-8 items-center justify-center rounded-xl bg-blue-50 text-blue-600">
+                        <Clock className="h-4 w-4" />
+                      </span>
+                      <span>Update timing</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setClinicQrDataUrl('');
+                        setClinicQrError('');
+                        setShowDoctorProfile(false);
+                        setShowClinicQrModal(true);
+                      }}
+                      disabled={!clinicBookingUrl}
+                      className="flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left text-xs font-bold text-slate-600 transition-colors hover:bg-violet-50 hover:text-violet-700 disabled:opacity-50"
+                    >
+                      <span className="flex h-8 w-8 items-center justify-center rounded-xl bg-violet-50 text-violet-600">
+                        <QrCode className="h-4 w-4" />
+                      </span>
+                      <span>Booking QR</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={openDoctorEdit}
+                      className="flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left text-xs font-bold text-slate-600 transition-colors hover:bg-blue-50 hover:text-blue-700"
+                    >
+                      <span className="flex h-8 w-8 items-center justify-center rounded-xl bg-blue-50 text-blue-600">
+                        <UserRound className="h-4 w-4" />
+                      </span>
+                      <span>Edit doctor details</span>
+                    </button>
+                    <div className="my-1 border-t border-slate-100" />
+                    <button
+                      type="button"
+                      onClick={handleLogout}
+                      className="flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left text-xs font-bold text-rose-600 transition-colors hover:bg-rose-50"
+                    >
+                      <span className="flex h-8 w-8 items-center justify-center rounded-xl bg-rose-50 text-rose-600">
+                        <LogOut className="h-4 w-4" />
+                      </span>
+                      <span>Log Out</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </header>
@@ -1360,10 +1517,10 @@ export default function ReceptionDeskPage() {
                 {isSoloClinicMode && (
                   <div className="flex justify-between items-center pt-2 border-t border-slate-100">
                     <span className="text-xs text-slate-500 font-medium flex items-center gap-1">
-                      <IndianRupee className="w-3.5 h-3.5" /> Est. Collections:
+                      <IndianRupee className="w-3.5 h-3.5" /> Collections:
                     </span>
                     <span className="text-sm font-black text-slate-900 font-mono">
-                      ₹{estimatedCollection.toLocaleString('en-IN')}
+                      ₹{todayCollection.toLocaleString('en-IN')}
                     </span>
                   </div>
                 )}
@@ -2164,6 +2321,102 @@ export default function ReceptionDeskPage() {
                 <span>Print</span>
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {showDoctorEdit && currentDoctor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-xs">
+          <form onSubmit={handleUpdateDoctorDetails} className="w-full max-w-sm rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl" role="dialog" aria-modal="true" aria-labelledby="edit-doctor-title">
+            <div className="mb-5 flex items-center justify-between">
+              <h3 id="edit-doctor-title" className="text-lg font-black text-slate-900">Edit doctor details</h3>
+              <button type="button" onClick={() => setShowDoctorEdit(false)} className="rounded-lg p-1 text-slate-400 hover:bg-slate-100" aria-label="Close edit doctor details">
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+            {doctorEditError && <p role="alert" className="mb-4 rounded-xl bg-rose-50 p-3 text-xs font-semibold text-rose-700">{doctorEditError}</p>}
+            <div className="space-y-4">
+              <label className="block text-xs font-bold text-slate-700">Doctor name
+                <input value={doctorEditName} onChange={(event) => setDoctorEditName(event.target.value)} className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2.5 text-sm text-slate-900" />
+              </label>
+              <label className="block text-xs font-bold text-slate-700">Room number
+                <input value={doctorEditRoom} onChange={(event) => setDoctorEditRoom(event.target.value)} className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2.5 text-sm text-slate-900" />
+              </label>
+              <label className="block text-xs font-bold text-slate-700">Consultation fee
+                <input type="number" min="0" step="1" value={doctorEditFee} onChange={(event) => setDoctorEditFee(event.target.value)} className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2.5 text-sm text-slate-900" />
+              </label>
+            </div>
+            <div className="mt-6 flex justify-end gap-2">
+              <button type="button" onClick={() => setShowDoctorEdit(false)} className="rounded-xl border border-slate-300 px-4 py-2.5 text-xs font-bold text-slate-700 hover:bg-slate-50">Cancel</button>
+              <button type="submit" disabled={actionLoading} className="rounded-xl bg-blue-600 px-4 py-2.5 text-xs font-bold text-white hover:bg-blue-700 disabled:opacity-50">{actionLoading ? 'Saving...' : 'Save details'}</button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {showClinicQrModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-xs">
+          <div
+            className="w-full max-w-sm rounded-2xl border border-slate-200 bg-white p-6 text-center shadow-2xl"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="clinic-qr-title"
+          >
+            <div className="mb-4 flex items-start justify-between gap-4 text-left">
+              <div>
+                <h3 id="clinic-qr-title" className="text-lg font-black text-slate-900">
+                  Patient Booking QR
+                </h3>
+                <p className="mt-1 text-xs text-slate-500">
+                  Patients can scan this code to see doctors and book a token at {currentDoctor?.clinic_name || 'your clinic'}.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowClinicQrModal(false)}
+                className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+                aria-label="Close booking QR dialog"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            {clinicQrError ? (
+              <p role="alert" className="rounded-xl bg-rose-50 p-4 text-sm font-semibold text-rose-700">
+                {clinicQrError}
+              </p>
+            ) : clinicQrDataUrl ? (
+              <>
+                <div className="mx-auto w-fit rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
+                  <img
+                    src={clinicQrDataUrl}
+                    alt={`Booking QR code for ${currentDoctor?.clinic_name || 'the clinic'}`}
+                    className="h-64 w-64"
+                  />
+                </div>
+                <p className="mt-3 break-all text-[11px] text-slate-400">{clinicBookingUrl}</p>
+                <div className="mt-5 flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowClinicQrModal(false)}
+                    className="flex-1 rounded-xl border border-slate-300 py-2.5 text-xs font-bold text-slate-700 hover:bg-slate-50"
+                  >
+                    Close
+                  </button>
+                  <button
+                    type="button"
+                    onClick={downloadClinicQr}
+                    className="flex-1 rounded-xl bg-violet-600 py-2.5 text-xs font-bold text-white shadow-md hover:bg-violet-700"
+                  >
+                    Download QR
+                  </button>
+                </div>
+              </>
+            ) : (
+              <div className="flex h-64 items-center justify-center text-sm font-semibold text-slate-400">
+                Creating QR code...
+              </div>
+            )}
           </div>
         </div>
       )}
